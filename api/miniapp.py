@@ -15,6 +15,7 @@ import os
 import re
 import json
 import html as htmllib
+import hashlib
 
 from api import webhook as w
 from lib import ledger
@@ -119,56 +120,141 @@ def _lead(it, city="", new_ids=(), crm=None):
     }
 
 
+def _cache_token(key, mode, city, flags=""):
+    return hashlib.md5(f"{key}|{mode}|{city.lower()}|{flags}".encode()).hexdigest()[:10]
+
+
+def _stale(key, mode, city, flags):
+    try:
+        hit = w.cache_load(_cache_token(key, mode, city, flags))
+        if hit and hit.get("res"):
+            return hit["res"]
+    except Exception:
+        pass
+    return None
+
+
+def _niche_keys(data):
+    raw = data.get("keys")
+    keys = []
+    if isinstance(raw, list):
+        for k in raw:
+            k = str(k or "").strip()
+            if k in w.NICHES and k not in keys:
+                keys.append(k)
+    if not keys:
+        k = data.get("key")
+        if k in w.NICHES:
+            keys = [k]
+    if not keys:
+        keys = ["barber"]
+    return keys[:4]
+
+
+def _label_for(keys):
+    labels = []
+    for k in keys:
+        lab = w.NICHES[k][0]
+        # убираем ведущий emoji для компактности
+        lab = re.sub(r"^[^\wА-Яа-яA-Za-z]+", "", lab).strip() or lab
+        labels.append(lab)
+    if len(labels) <= 2:
+        return " + ".join(labels)
+    return labels[0] + " + " + labels[1] + f" + ещё {len(labels)-2}"
+
+
 def search(data):
-    key = data.get("key") if data.get("key") in w.NICHES else "barber"
+    keys = _niche_keys(data)
     mode = data.get("mode") if data.get("mode") in w.MODES else "n"
     city = " ".join(str(data.get("city") or "").split())[:80]
     if not city:
         return {"ok": False, "error": "Напишите город"}
     flags = "".join(ch for ch in str(data.get("flags") or "") if ch in "pec")
 
-    try:
-        res = w.find_leads(key, mode, city, flags)
-    except Exception as err:
-        print("miniapp search fail", err)
-        return {"ok": False, "error": "Карты временно недоступны — попробуйте ещё раз"}
-    if res is None:
-        return {"ok": False,
-                "error": "Не нашёл такой город. Напишите по-английски или добавьте страну."}
+    merged, seen = [], set()
+    n_no = n_weak = n_with = 0
+    errors = 0
+    used_stale = False
+    per_budget = 45 if len(keys) == 1 else 18 if len(keys) == 2 else 14
+    for key in keys:
+        try:
+            try:
+                res = w.find_leads(key, mode, city, flags, budget_s=per_budget)
+            except TypeError:
+                res = w.find_leads(key, mode, city, flags)
+        except Exception as err:
+            print("miniapp search fail", key, err)
+            if str(err) == "geocode down":
+                # геокодер недоступен — пробуем stale, иначе понятная ошибка
+                res = _stale(key, mode, city, flags)
+                if res:
+                    used_stale = True
+                else:
+                    errors += 1
+                    if len(keys) == 1:
+                        return {"ok": False, "error": "Сервис геокодирования временно недоступен. Попробуйте ещё раз через 20 секунд или укажите город и страну."}
+                    continue
+            else:
+                res = _stale(key, mode, city, flags)
+                if res:
+                    used_stale = True
+                else:
+                    errors += 1
+                    continue
+        if res is None:
+            if len(keys) == 1:
+                return {"ok": False,
+                        "error": "Не нашёл такой город. Напишите по-английски или добавьте страну."}
+            continue
+        items, a, b, c = res
+        n_no += a; n_weak += b; n_with += c
+        for it in items:
+            it = dict(it)
+            it.setdefault("niche_key", key)
+            it["id"] = ledger.lead_id(it.get("name"), it.get("addr"),
+                                      it.get("site"), city,
+                                      it.get("lat"), it.get("lon"))
+            if len(keys) > 1 and it["id"] in seen:
+                continue
+            seen.add(it["id"])
+            merged.append(it)
 
-    items, n_no, n_weak, n_with = res
-    for it in items:
-        it.setdefault("id", ledger.lead_id(it.get("name"), it.get("addr"),
-                                            it.get("site"), city,
-                                            it.get("lat"), it.get("lon")))
-    label = w.NICHES[key][0].replace("🦷", "").replace("🩺", "").strip() or w.NICHES[key][0]
-    q = ledger.query_id(key, mode, city, flags)
+    if not merged and errors:
+        return {"ok": False, "error": "Карты временно недоступны. Попробуйте ещё раз через 20-30 секунд."}
+
+    label = _label_for(keys)
+    q = ledger.query_id("+".join(sorted(keys)), mode, city, flags)
     try:
-        new_ids = ledger.record_search(q, city, label, mode, flags, items, key)
+        new_ids = ledger.record_search(q, city, label, mode, flags, merged, "+".join(sorted(keys)))
     except Exception as err:
         print("miniapp history error", err)
-        new_ids = [it["id"] for it in items]
+        new_ids = [it["id"] for it in merged]
     try:
         crm = w.crm_all() if w.CRM_ON else {}
     except Exception:
         crm = {}
+
     if mode == "n":
         count = n_no
     elif mode == "w":
         count = n_weak
     else:
         count = n_no + n_weak
+
     return {
         "ok": True,
         "query_id": q,
         "new_ids": new_ids,
         "city": city,
         "niche_label": label,
+        "niche_keys": keys,
         "nosite": n_no,
         "weak": n_weak,
-        "total": len(items),
+        "total": len(merged),
+        "stale": used_stale,
+        "partial": errors > 0,
         "potential": _plain(w.potential_text(count)),
-        "items": [_lead(it, city, new_ids, crm) for it in items],
+        "items": [_lead(it, city, new_ids, crm) for it in merged],
     }
 
 

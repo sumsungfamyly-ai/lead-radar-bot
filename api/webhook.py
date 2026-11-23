@@ -940,14 +940,21 @@ def geocode(city):
     return "notfound" if answered else None
 
 
-def find_leads(niche_key, mode, city, flags=""):
+def find_leads(niche_key, mode, city, flags="", budget_s=45):
     """flags: p — только с телефоном, e — только с email, c — без сетей."""
-    deadline = time.time() + 45  # общий бюджет: Vercel даёт 60 с, оставляем запас
+    deadline = time.time() + max(12, min(55, float(budget_s or 45)))
     city, radius = parse_city(city)
     geo = geocode(city)
     if geo == "notfound":
         return None
     if geo is None:
+        try:
+            tok = hashlib.md5(f"{niche_key}|{mode}|{city.lower()}|{flags}".encode()).hexdigest()[:10]
+            stale = cache_load(tok)
+            if stale and stale.get("res"):
+                return stale["res"]
+        except Exception:
+            pass
         raise RuntimeError("geocode down")
     lat, lon, bbox = geo
     if radius:
@@ -1018,6 +1025,14 @@ def find_leads(niche_key, mode, city, flags=""):
             print("used osm api fallback")
         except Exception as err:
             print("osm api fail", err)
+            try:
+                tok = hashlib.md5(f"{niche_key}|{mode}|{city.lower()}|{flags}".encode()).hexdigest()[:10]
+                stale = cache_load(tok)
+                if stale and stale.get("res"):
+                    print("used stale cache after maps down")
+                    return stale["res"]
+            except Exception:
+                pass
             raise RuntimeError("maps down")
 
     elements = data.get("elements", [])
