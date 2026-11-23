@@ -1,7 +1,6 @@
 import os, re, ssl, json, time, html, datetime
 import urllib.request, urllib.parse, urllib.error
 import concurrent.futures as cf
-from http.server import BaseHTTPRequestHandler
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -763,16 +762,20 @@ def handle(update):
     send_menu(chat_id)
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
-            self.send_response(403); self.end_headers(); return
+def _respond(start_response, status, body):
+    start_response(status, [("Content-Type", "text/plain; charset=utf-8")])
+    return [body]
+
+
+def app(environ, start_response):
+    """WSGI-приложение: Vercel вызывает его на каждый запрос от Telegram."""
+    if environ.get("REQUEST_METHOD") == "POST":
+        if SECRET and environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN") != SECRET:
+            return _respond(start_response, "403 Forbidden", b"forbidden")
         try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            handle(json.loads(body))
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+            handle(json.loads(environ["wsgi.input"].read(length)))
         except Exception as e:
             print("error", e)
-        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"bot is running")
+        return _respond(start_response, "200 OK", b"ok")
+    return _respond(start_response, "200 OK", b"bot is running")
