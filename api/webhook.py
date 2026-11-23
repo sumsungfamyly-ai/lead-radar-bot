@@ -3,6 +3,8 @@ import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 import concurrent.futures as cf
 
+from lib import ledger
+
 TOKEN = os.environ.get("BOT_TOKEN", "")
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
 API = f"https://api.telegram.org/bot{TOKEN}/"
@@ -551,8 +553,48 @@ def kv_cmd(*args):
 
 
 def lead_id(it):
-    return hashlib.md5(f"{it['name'].lower()}|{round(it['lat'], 4)}|{round(it['lon'], 4)}"
-                       .encode()).hexdigest()[:12]
+    """Один id для CRM, истории, Mini App и cron."""
+    return ledger.lead_id(it.get("name", ""), it.get("addr", ""),
+                          it.get("site", ""), it.get("city", ""),
+                          it.get("lat"), it.get("lon"))
+
+
+def lead_socials(tags):
+    """Достаём соцсети из OSM-тегов и приводим к ссылкам."""
+    out = []
+    rules = [
+        ("contact:instagram", "Instagram", "https://instagram.com/"),
+        ("instagram", "Instagram", "https://instagram.com/"),
+        ("contact:facebook", "Facebook", "https://facebook.com/"),
+        ("facebook", "Facebook", "https://facebook.com/"),
+        ("contact:telegram", "Telegram", "https://t.me/"),
+        ("telegram", "Telegram", "https://t.me/"),
+        ("contact:vk", "ВКонтакте", "https://vk.com/"),
+        ("vk", "ВКонтакте", "https://vk.com/"),
+    ]
+    for tag, label, prefix in rules:
+        value = (tags.get(tag) or "").strip()
+        if not value:
+            continue
+        url = value if value.startswith("http") else prefix + value.lstrip("@/")
+        out.append({"label": label, "url": url})
+    return out[:4]
+
+
+def lead_audit(it, issues=None):
+    """Дешёвый аудит из уже собранных данных — без дополнительных запросов."""
+    keys = {k for k, _ in (issues or it.get("issues") or [])}
+    if not it.get("site"):
+        return {"site_ok": False, "https": False, "phone_on_site": False,
+                "issues": ["нет сайта"]}
+    return {
+        "site_ok": not ({"dead", "social"} & keys),
+        "https": "https" not in keys,
+        "phone_on_site": None,
+        "mobile": "mobile" not in keys,
+        "load_s": None,
+        "issues": [txt for k, txt in (issues or it.get("issues") or [])][:4],
+    }
 
 
 def crm_all():
@@ -574,7 +616,8 @@ CRM_LABEL = {"contacted": "✍️ написали", "deal": "🤝 сделка"
 
 def crm_set(it, status):
     db = crm_all()
-    rec = db.get(lead_id(it), {})
+    lid = lead_id(it)
+    rec = db.get(lid, {})
     rec.update(name=it["name"], status=status, ts=int(time.time()),
                site=it.get("site", ""), phone=it.get("phone", ""))
     if status == "contacted":
@@ -582,8 +625,13 @@ def crm_set(it, status):
         rec["fu"] = 1
     else:
         rec.pop("next", None)
-    db[lead_id(it)] = rec
+    db[lid] = rec
     crm_save(db)
+    try:
+        ledger.set_status(lid, "lost" if status == "refused" else status,
+                          it.get("name", ""), it.get("site", ""))
+    except Exception as e:
+        print("ledger sync error", e)
     return rec
 
 
@@ -1004,8 +1052,12 @@ def find_leads(niche_key, mode, city, flags=""):
             "phone": t.get("phone") or t.get("contact:phone") or "",
             "email": t.get("email") or t.get("contact:email") or "",
             "addr": (t.get("addr:street", "") + " " + t.get("addr:housenumber", "")).strip(),
-            "score": 0, "issues": [],
+            "score": 0, "issues": [], "city": city,
+            "socials": lead_socials(t),
+            "hours": t.get("opening_hours") or "",
         }
+        it["id"] = lead_id(it)
+        it["audit"] = lead_audit(it)
         if "p" in flags and not it["phone"]:
             continue
         if "e" in flags and not it["email"]:
@@ -1026,6 +1078,7 @@ def find_leads(niche_key, mode, city, flags=""):
                 try:
                     it = futs[f]
                     it["score"], it["issues"] = f.result()
+                    it["audit"] = lead_audit(it, it["issues"])
                     if it["score"] >= WEAK_MIN:
                         it["kind"] = "weak"
                         weak.append(it)
@@ -1221,6 +1274,14 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
         tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷 Проверь название или напиши по-английски.")
         return send_menu(chat_id)
     items, n_no, n_weak, n_with = res
+    new_ids = []
+    if fresh:
+        try:
+            q = ledger.query_id(key, mode, city, flags)
+            new_ids = ledger.record_search(q, city, NICHES[key][0], mode, flags,
+                                           res[0], key)
+        except Exception as e:
+            print("history error", e)
     db = crm_all()
     if CRM_ON:  # уже обработанных клиентов в поиске больше не показываем
         items = [it for it in items
@@ -1231,6 +1292,7 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
                 text=(f"📊 <b>{esc(city)}</b>, {NICHES[key][0]}\n"
                       f"🚫 без сайта: <b>{n_no}</b>\n"
                       f"🐌 слабых сайтов: <b>{n_weak}</b> (проверено до {MAX_ANALYZE} из {n_with})"
+                      + (f"\n🆕 новых: <b>{len(new_ids)}</b>" if new_ids else "")
                       + potential_text(n_no)))
         if sm:
             remember(chat_id, "summary", sm["message_id"])
@@ -1468,7 +1530,7 @@ HELP_TEXT = ("👋 <b>Бот для поиска клиентов</b>\n\n"
              "для директа, звонка и email на 6 языках (RU, EN, FI, ET, SV, DE). Ещё подсказывает, как отвечать на "
              "возражения и вести клиента до сделки.\n\n"
              "/start — меню\n/tips — советы по продажам\n/me — твои данные для текстов\n"
-             "/stats — база клиентов и напоминания\n/fav — избранное\n\n"
+             "/stats — база клиентов и напоминания\n/history — последние поиски\n/funnel — воронка по статусам\n/fav — избранное\n\n"
              "Под карточкой: 🖼 скриншот сайта, 🚀 скорость от Google, 📥 CSV-выгрузка.\n🙈 Скрыть / 📂 Показать снова — управлять результатами.\nВ скриптах: 🤝 Закрыть сделку — как довести клиента до оплаты.\n\nПоехали 👇")
 
 if MINIAPP_URL:
@@ -1540,6 +1602,52 @@ def send_fav(chat_id):
                disable_web_page_preview=True, reply_markup=CLOSE_KB)
     if m:
         remember(chat_id, "fav", m["message_id"])
+
+
+def _ago(ts):
+    diff = max(0, int(time.time()) - int(ts or 0))
+    if diff < 3600:
+        return "только что" if diff < 120 else f"{diff // 60} мин назад"
+    if diff < 86400:
+        return f"{diff // 3600} ч назад"
+    return f"{diff // 86400} дн назад"
+
+
+def send_history(chat_id):
+    rows = ledger.history_list(10)["items"]
+    if not rows:
+        text = "🕘 Истории поиска пока нет. Найди клиентов — и я запомню запрос."
+    else:
+        text = "🕘 <b>Последние поиски</b>\n\n"
+        for r in rows:
+            text += (f"• {esc(r['city'])} · {esc(r['label'])} — {r['count']} лидов, "
+                     f"новых: {r['new_count']} ({_ago(r['ts'])})\n")
+    buttons = []
+    for r in rows[:5]:
+        buttons.append([{"text": f"🔎 {r['city'][:18]}",
+                         "callback_data": f"h|{r['q']}"}])
+    buttons.append([{"text": "❌ Закрыть", "callback_data": "del"}])
+    m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+           reply_markup={"inline_keyboard": buttons})
+    if m:
+        remember(chat_id, "stats", m["message_id"])
+
+
+def send_funnel(chat_id):
+    d = ledger.funnel(limit=20)
+    c = d["counts"]
+    lines = [f"{lab.split(' ', 1)[-1]}: <b>{c[key]}</b>" for key, lab in ledger.STATUSES]
+    text = "📊 <b>Воронка клиентов</b>\n\n" + "\n".join(lines)
+    if d["items"]:
+        text += "\n\n<b>Последние:</b>\n"
+        for r in d["items"][:15]:
+            lab = dict(ledger.STATUSES).get(r["status"], "🆕 Новый")
+            text += f"• {lab} — {esc(r['name'] or 'без названия')}\n"
+    else:
+        text += "\n\nПока нет лидов в базе. Отмечай статусы в мини-приложении или под карточкой."
+    m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=CLOSE_KB)
+    if m:
+        remember(chat_id, "stats", m["message_id"])
 
 
 # Защита от повторов: Telegram переотправляет апдейт, если бот отвечал слишком долго.
@@ -1642,6 +1750,18 @@ def handle(update):
             if sm:
                 remember(chat_id, "summary", sm["message_id"])
             run_search(chat_id, hit["key"], hit["mode"], hit["city"], offset, token=parts[1])
+        elif parts[0] == "h" and len(parts) > 1:
+            q = parts[1]
+            row = next((r for r in ledger.history() if r.get("q") == q), None)
+            if not row:
+                tg("sendMessage", chat_id=chat_id, text="Поиск не найден. Запусти его заново из меню.")
+                return
+            key = row.get("niche_key") or "barber"
+            if key not in NICHES:
+                key = "barber"
+            delete_msg(chat_id, mid)
+            run_search(chat_id, key, row.get("mode") or "n", row.get("city") or "",
+                       0, flags=row.get("flags") or "")
         elif parts[0] == "menu":
             # превращаем сообщение со счётчиком страниц в меню — без нового сообщения
             st = _CHAT.setdefault(chat_id, {})
@@ -1745,6 +1865,10 @@ def handle(update):
         return send_stats(chat_id)
     if text.startswith("/fav"):
         return send_fav(chat_id)
+    if text.startswith("/history"):
+        return send_history(chat_id)
+    if text.startswith("/funnel"):
+        return send_funnel(chat_id)
     if text.startswith("/me"):
         m = tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
                text=("⚙️ <b>Твои данные в текстах</b>\n"

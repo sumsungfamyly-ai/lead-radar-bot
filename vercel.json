@@ -5,7 +5,7 @@
       "maxDuration": 60
     },
     "api/cron.py": {
-      "maxDuration": 30
+      "maxDuration": 60
     },
     "api/miniapp.py": {
       "maxDuration": 60
