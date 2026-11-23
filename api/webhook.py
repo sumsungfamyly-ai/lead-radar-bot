@@ -25,6 +25,12 @@ DEFAULT_LANG = (os.environ.get("DEFAULT_LANG") or "ru").lower()
 MY_CHAT_ID = os.environ.get("MY_CHAT_ID") or ""   # куда слать напоминания (cron)
 PSI_KEY = os.environ.get("PAGESPEED_API_KEY") or ""  # необязательно, повышает лимиты
 
+# ---------- Мини-приложение (тот же бот, но наглядно) ----------
+APP_URL = (os.environ.get("APP_URL") or "").rstrip("/")
+if not APP_URL and os.environ.get("VERCEL_URL"):
+    APP_URL = "https://" + os.environ["VERCEL_URL"].rstrip("/")
+MINIAPP_URL = APP_URL + "/api/miniapp" if APP_URL else ""
+
 # ---------- CRM (необязательно): бесплатный Upstash Redis ----------
 # Если не задано — бот работает как раньше, просто без базы клиентов.
 UPSTASH_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
@@ -439,7 +445,7 @@ GENERAL_TIPS = (
 )
 
 
-from api.sales import (SCRIPTS as _SCRIPTS, PLAN_NOSITE as _PLAN_NOSITE,
+from lib.sales import (SCRIPTS as _SCRIPTS, PLAN_NOSITE as _PLAN_NOSITE,
                        PLAN_WEAK as _PLAN_WEAK, GENERAL_TIPS as _GENERAL_TIPS,
                        OBJECTIONS as _OBJECTIONS)
 T.update(_SCRIPTS)  # продающие тексты FULLY заменяют старые шаблоны выше
@@ -1041,6 +1047,8 @@ def menu_markup():
             row = []
     if row:
         rows.append(row)
+    if MINIAPP_URL:  # открывается внутри Telegram, без перехода в браузер
+        rows.append([{"text": "🚀 Открыть мини-приложение", "web_app": {"url": MINIAPP_URL}}])
     rows.append([{"text": "🎯 Советы по продажам", "callback_data": "tips", "style": "success"}])
     return {"inline_keyboard": rows}
 
@@ -1463,6 +1471,9 @@ HELP_TEXT = ("👋 <b>Бот для поиска клиентов</b>\n\n"
              "/stats — база клиентов и напоминания\n/fav — избранное\n\n"
              "Под карточкой: 🖼 скриншот сайта, 🚀 скорость от Google, 📥 CSV-выгрузка.\n🙈 Скрыть / 📂 Показать снова — управлять результатами.\nВ скриптах: 🤝 Закрыть сделку — как довести клиента до оплаты.\n\nПоехали 👇")
 
+if MINIAPP_URL:
+    HELP_TEXT += "\n\n🚀 Мини-приложение (кнопка в меню) — тот же поиск, но наглядно."
+
 CRM_HINT = ("📒 <b>База клиентов не подключена</b>\n\n"
             "Чтобы отмечать «✅ Написал / 🤝 Сделка / ❌ Отказ», вести избранное и получать "
             "напоминания о follow-up:\n"
@@ -1534,6 +1545,39 @@ def send_fav(chat_id):
 # Защита от повторов: Telegram переотправляет апдейт, если бот отвечал слишком долго.
 # Запоминаем обработанные update_id, чтобы не отвечать дважды/трижды.
 _SEEN_UPDATES = {}
+
+
+def handle_webapp_data(chat_id, raw, message_id=None):
+    """Кнопка «Отправить в чат» из мини-приложения: открываем панель скриптов."""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(d, dict):
+        return
+    keys, texts = [], []
+    for x in (d.get("issues") or []):
+        if isinstance(x, (list, tuple)):
+            if x:
+                keys.append(str(x[0]))
+            if len(x) > 1:
+                texts.append(str(x[1]))
+        elif isinstance(x, str):
+            keys.append(x)
+    ctx = {
+        "name": str(d.get("name") or "Клиент")[:80],
+        "kind": "weak" if d.get("kind") == "weak" else "nosite",
+        "domain": re.sub(r"^https?://", "", str(d.get("site") or "")).rstrip("/"),
+        "issues": ", ".join(texts),
+        "keys": keys,
+        "lang": d.get("lang") if d.get("lang") in T else DEFAULT_LANG,
+    }
+    if message_id:
+        delete_msg(chat_id, message_id)  # системное сообщение мини-приложения не нужно
+    m = tg("sendMessage", chat_id=chat_id, text=panel_text(ctx), parse_mode="HTML",
+           reply_markup=panel_markup(ctx), disable_web_page_preview=True)
+    if m:
+        remember(chat_id, "panel", m["message_id"])
 
 
 def handle(update):
@@ -1682,7 +1726,13 @@ def handle(update):
         return
 
     msg = update.get("message")
-    if not msg or "text" not in msg:
+    if not msg:
+        return
+    if msg.get("web_app_data"):  # данные из мини-приложения
+        return handle_webapp_data(msg["chat"]["id"],
+                                  msg["web_app_data"].get("data", ""),
+                                  msg.get("message_id"))
+    if "text" not in msg:
         return
     chat_id, text = msg["chat"]["id"], msg["text"].strip()
 

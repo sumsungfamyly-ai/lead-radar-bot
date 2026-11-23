@@ -195,5 +195,59 @@ assert "Что ищем?" in msgs[pager]
 w.handle(cb("back_menu", pager))
 assert "Выбери нишу" in msgs[pager], "кнопка Назад не вернула меню"
 
-print("OK: все 16 сценариев прошли")
+# 17. мини-приложение: HTML и JSON-маршруты отвечают без ошибок
+import io
+from api import miniapp as ma
+
+def wsgi(path, method="GET", body=None):
+    data = json.dumps(body).encode() if body is not None else b""
+    env = {"PATH_INFO": path, "REQUEST_METHOD": method,
+           "CONTENT_LENGTH": str(len(data)), "wsgi.input": io.BytesIO(data)}
+    got = {}
+    def start(status, headers):
+        got["status"] = status
+    raw = b"".join(ma.app(env, start))
+    return got["status"], raw
+
+status, raw = wsgi("/api/miniapp")
+assert status == "200 OK" and b"LEAD RADAR" in raw and b"radar" in raw, "HTML мини-приложения не отдан"
+status, raw = wsgi("/api/miniapp/config")
+cfg = json.loads(raw)
+assert cfg["ok"] and any(n["key"] == "barber" for n in cfg["niches"]), "нет ниш в конфиге"
+assert cfg["default_niche"] == "barber" and len(cfg["langs"]) == 6
+
+# 18. поиск в мини-приложении использует ту же функцию, что и бот
+n_search = searches[0]
+status, raw = wsgi("/api/miniapp/search", "POST",
+                   {"key": "barber", "mode": "n", "city": "Helsinki", "flags": "p"})
+r = json.loads(raw)
+assert r["ok"] and searches[0] == n_search + 1, "мини-приложение не вызвало поиск бота"
+assert r["total"] == 12 and r["items"][0]["kind"] == "nosite" and r["items"][0]["pitch"]
+assert json.loads(wsgi("/api/miniapp/search", "POST", {"city": ""})[1])["ok"] is False
+
+# 19. скрипты мини-приложения: все 7 вкладок на всех 6 языках
+issue = [["mobile", "не адаптирован под телефон"], ["https", "нет HTTPS"]]
+for lang in w.T:
+    status, raw = wsgi("/api/miniapp/scripts", "POST",
+                       {"name": "Тест", "kind": "weak", "issues": issue,
+                        "domain": "site.fi", "site": "http://site.fi", "lang": lang})
+    rr = json.loads(raw)
+    assert rr["ok"] and set(("dm", "call", "em", "fu", "obj", "plan", "close")) <= set(rr["body"])
+    assert all(rr["body"].values()), f"пустая вкладка на языке {lang}"
+nosite_dm = json.loads(wsgi("/api/miniapp/scripts", "POST",
+                            {"name": "Тест", "kind": "nosite", "lang": "ru"})[1])["body"]["dm"]
+assert "Тест" in nosite_dm, "скрипт для лида без сайта не подставил имя"
+
+# 20. «Отправить в чат» и кнопка в меню
+payload = json.dumps({"name": "Тест", "kind": "nosite", "site": "", "issues": [], "lang": "ru"})
+w.handle({"message": {"message_id": 7777, "chat": {"id": 1},
+                      "web_app_data": {"data": payload}}})
+assert 7777 not in msgs, "служебное сообщение мини-приложения не удалено"
+assert any(t.startswith("✍️") and "Тест" in t for t in msgs.values()), "панель скриптов не открылась"
+w.MINIAPP_URL = "https://example.vercel.app/api/miniapp"
+buttons = [b for row in w.menu_markup()["inline_keyboard"] for b in row]
+assert any("web_app" in b for b in buttons), "в меню нет кнопки мини-приложения"
+w.MINIAPP_URL = ""
+
+print("OK: все 20 сценариев прошли")
 print("живых сообщений в чате:", len(msgs))

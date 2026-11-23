@@ -6,6 +6,9 @@
     },
     "api/cron.py": {
       "maxDuration": 30
+    },
+    "api/miniapp.py": {
+      "maxDuration": 60
     }
   },
   "crons": [
