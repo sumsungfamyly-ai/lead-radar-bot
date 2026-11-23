@@ -1,4 +1,4 @@
-import os, re, ssl, json, time, html, hashlib, datetime
+import os, re, ssl, json, time, html, hashlib, datetime, io, csv, base64
 import urllib.request, urllib.parse, urllib.error
 import concurrent.futures as cf
 
@@ -9,8 +9,11 @@ UA = {"User-Agent": "leads-finder-bot/3.0 (telegram bot)"}
 BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
            "Accept-Language": "en,ru;q=0.8,fi;q=0.6"}
+# Запасные серверы карт: если один лёг или перегружен, идём к следующему
 OVERPASS = ["https://overpass-api.de/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter"]
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+            "https://overpass.osm.jp/api/interpreter"]
 
 # ---------- ТВОИ ДАННЫЕ (задаются в Vercel -> Environment Variables) ----------
 ME = os.environ.get("MY_NAME") or "[ваше имя]"
@@ -18,6 +21,14 @@ CONTACT = os.environ.get("MY_CONTACT") or "[ваш Telegram / телефон]"
 PORTFOLIO = os.environ.get("MY_PORTFOLIO") or "[ссылка на портфолио]"
 PRICE = os.environ.get("MY_PRICE") or ""          # например: от 300 €
 DEFAULT_LANG = (os.environ.get("DEFAULT_LANG") or "ru").lower()
+MY_CHAT_ID = os.environ.get("MY_CHAT_ID") or ""   # куда слать напоминания (cron)
+PSI_KEY = os.environ.get("PAGESPEED_API_KEY") or ""  # необязательно, повышает лимиты
+
+# ---------- CRM (необязательно): бесплатный Upstash Redis ----------
+# Если не задано — бот работает как раньше, просто без базы клиентов.
+UPSTASH_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or ""
+CRM_ON = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 PAGE = 5            # карточек за раз
 WEAK_MIN = 30       # с какого балла сайт считается слабым
@@ -36,6 +47,13 @@ NICHES = {
     "estate": ("🏠 Недвижимость", ["office=estate_agent"]),
     "vet": ("🐶 Ветклиники", ["amenity=veterinary"]),
     "school": ("🎓 Школы и курсы", ["amenity=language_school", "amenity=driving_school"]),
+    "bakery": ("🥐 Пекарни и кондитерские", ["shop=bakery", "shop=confectionery"]),
+    "florist": ("💐 Цветочные магазины", ["shop=florist"]),
+    "carwash": ("🧽 Автомойки", ["amenity=car_wash"]),
+    "massage": ("💆 Массаж и SPA", ["shop=massage", "leisure=spa"]),
+    "repair": ("🔧 Ремонт техники", ["shop=electronics_repair", "craft=electronics_repair"]),
+    "accountant": ("🧾 Бухгалтеры", ["office=accountant"]),
+    "photo": ("📸 Фотостудии", ["shop=photo", "craft=photographer"]),
 }
 MODES = {"n": "🚫 Без сайта", "w": "🐌 Слабый сайт", "a": "🔥 Всё вместе"}
 STYLES = ["primary", "success", "danger"]  # синий, зелёный, красный
@@ -205,8 +223,153 @@ T = {
    "fine": "Hyvä, että olette tyytyväisiä. Näytän maksutta, miltä sivut näyttävät puhelimella ja kuinka nopeasti ne latautuvat. Jos kaikki on kunnossa, kerron sen suoraan.",
   },
  },
+ "et": {
+  "and": " ja ",
+  "prob": {
+   "mobile": "sait ei tööta hästi mobiiltelefonis",
+   "https": "saidil puudub turvaline HTTPS-ühendus",
+   "ssl": "saidi turvasertifikaadiga on probleem",
+   "stub": "sait tundub lõpetamata",
+   "old": "sait näeb välja aegunud",
+   "slow": "sait laadib aeglaselt",
+   "dead": "sait ei avane",
+   "social": "kodulehe asemel on ainult sotsiaalmeedia leht",
+   "seo": "saidil puudub otsingumootorite kirjeldus",
+   "generic": "saiti saaks märgatavalt parandada",
+  },
+  "dm_nosite": [
+   "Tere! Olen {me}. Leidsin «{biz}» kaardilt, aga oma kodulehte ei leidnud. Enamik kliente otsib teenuseid kõigepealt Google'ist telefoniga. Teen kodulehti kohalikele ettevõtetele{pricep}. Saan tasuta näidata «{biz}» kodulehe kavandit, ilma kohustusteta. Näited: {portfolio}. Kas saadan?",
+   "Tere! «{biz}» ei paista olevat kodulehte. Teen neid kohalikele ettevõtetele ja saan näidata tasuta kavandit. Kas huvitab?",
+  ],
+  "dm_weak": [
+   "Tere! Olen {me}. Vaatasin «{biz}» kodulehte ({domain}) ja märkasin: {problem}. See võib saata osa kliente konkurentide juurde. Saan tasuta teha üheleheküljelise ülevaate, mida parandada. Näited: {portfolio}. Kas saadan?",
+   "Tere! Külastasin {domain} ja märkasin: {problem}. Saan saata lühikese tasuta ülevaate parandustest. Kas huvitab?",
+  ],
+  "call": {
+   "open": "Tere päevast! Minu nimi on {me}. Võtan ainult minuti. Kas see on «{biz}»?",
+   "hook_nosite": "Leidsin teid kaardilt, aga kodulehte ei leidnud. Kas kliendid leiavad teid praegu internetist?",
+   "hook_weak": "Külastasin teie kodulehte {domain} ja märkasin: {problem}. Kas olete märganud, et see võib vähendada päringuid?",
+   "offer": "Teen kodulehti kohalikele ettevõtetele{pricep}. Saan tasuta teha lühikese ülevaate või kavandi, ilma kohustusteta.",
+   "close": "Kas saata WhatsAppi või e-postiga? Või helistame homme 10 minutiks?",
+   "secretary": "Soovin rääkida sellega, kes vastutab kodulehe või turunduse eest. Millal teda tabab?",
+   "mail": "Muidugi saadan. Öelge palun aadress ja kellele kirjutan.",
+  },
+  "em_subj_nosite": "Tasuta kodulehe kavand: «{biz}»",
+  "em_subj_weak": "Ideid saidi {domain} parandamiseks",
+  "em_nosite": "Tere!\n\nOlen {me}. Leidsin «{biz}» kaardilt ja märkasin, et teil pole oma kodulehte. Enamik kliente otsib teenuseid kõigepealt Google'ist telefoniga — koduleht aitab neid mitte kaotada.\n\nTeen kodulehti kohalikele ettevõtetele{pricep}. Saan tasuta teha «{biz}» kavandi, ilma kohustusteta.\n\nNäited töödest: {portfolio}\n\nKui huvitab, vastake lihtsalt sellele kirjale.\n\nLugupidamisega,\n{me}\n{contact}",
+  "em_weak": "Tere!\n\nOlen {me}. Vaatasin «{biz}» kodulehte ({domain}) ja märkasin: {problem}. See võib vähendada päringute arvu.\n\nTeen kodulehti kohalikele ettevõtetele{pricep} ja saan tasuta teha lühikese ülevaate (1 lehekülg) konkreetsete parandustega.\n\nNäited töödest: {portfolio}\n\nKui huvitab, vastake lihtsalt sellele kirjale.\n\nLugupidamisega,\n{me}\n{contact}",
+  "fu": [
+   "Tere! Tuletan meelde oma kirja «{biz}» kodulehe kohta. Kui praegu pole aega, öelge lihtsalt ja ma ei tülita. Kui huvitab, saadan kavandi 1–2 päevaga.",
+   "See on minu viimane kiri. Valmistasin «{biz}» jaoks lühikese kodulehe plaani. Kas saadan? Kui ei, soovin edu ettevõtluses!",
+  ],
+  "obj": {
+   "price": "Mõistan. Näitan kõigepealt tasuta kavandit ja te otsustate, kas see on oma hinda väärt. Sageli tasub üks-kaks uut klienti kodulehe kinni.",
+   "noneed": "Mõistan. Paljud arvavad nii, kuni näevad, kui palju kliente otsib teenuseid Google'ist. Saan kahe minutiga tasuta näidata, kuidas paistate konkurentide kõrval.",
+   "think": "Muidugi. Et otsustamine oleks lihtsam, saadan kavandi ja lühikese kirjelduse. Kas teisipäev või neljapäev sobib jätkuks?",
+   "have": "Tore, et sellega juba tegeletakse. Soovi korral saadan tasuta ülevaate praegusest saidist teise arvamusena, ilma kohustusteta.",
+   "social": "Sotsiaalmeedia on tähelepanu jaoks hea, aga kliendid otsivad Google'ist kodulehti. Sait täiendab sotsiaalmeediat, ei asenda seda. Saan näidata näiteid.",
+   "fine": "Hea, et olete rahul. Näitan tasuta, kuidas sait telefonis välja näeb ja kui kiiresti avaneb. Kui kõik on korras, ütlen seda otse.",
+  },
+ },
+ "sv": {
+  "and": " och ",
+  "prob": {
+   "mobile": "sajten fungerar dåligt i mobilen",
+   "https": "sajten saknar säker HTTPS-anslutning",
+   "ssl": "det finns problem med sajtens säkerhetscertifikat",
+   "stub": "sajten ser ofärdig ut",
+   "old": "sajten ser föråldrad ut",
+   "slow": "sajten laddar långsamt",
+   "dead": "sajten öppnar inte",
+   "social": "ni har bara en sociala medier-sida i stället för en webbplats",
+   "seo": "sajten saknar beskrivning för sökmotorer",
+   "generic": "sajten kan förbättras tydligt",
+  },
+  "dm_nosite": [
+   "Hej! Jag heter {me}. Jag hittade «{biz}» på kartan men ingen egen webbplats. De flesta kunder söker tjänster i Google med mobilen först. Jag bygger webbplatser för lokala företag{pricep}. Jag kan visa en gratis skiss för «{biz}», utan förpliktelser. Exempel: {portfolio}. Ska jag skicka?",
+   "Hej! «{biz}» verkar sakna webbplats. Jag bygger sådana för lokala företag och kan visa en gratis skiss. Intresserad?",
+  ],
+  "dm_weak": [
+   "Hej! Jag heter {me}. Jag tittade på webbplatsen för «{biz}» ({domain}) och märkte: {problem}. Det kan göra att kunder går till konkurrenter. Jag kan gratis ta fram en genomgång på en sida. Exempel: {portfolio}. Ska jag skicka?",
+   "Hej! Jag besökte {domain} och märkte: {problem}. Jag kan skicka en kort gratis genomgång. Intresserad?",
+  ],
+  "call": {
+   "open": "God dag! Jag heter {me}. Jag tar bara en minut. Är det «{biz}»?",
+   "hook_nosite": "Jag hittade er på kartan men ingen webbplats. Hittar kunderna er online i dag?",
+   "hook_weak": "Jag besökte er webbplats {domain} och märkte: {problem}. Har ni märkt att det kan kosta er förfrågningar?",
+   "offer": "Jag bygger webbplatser för lokala företag{pricep}. Jag kan gratis ta fram en kort genomgång eller skiss, utan förpliktelser.",
+   "close": "Vill ni ha det via WhatsApp eller e-post? Eller ringer vi 10 minuter i morgon?",
+   "secretary": "Jag vill tala med den som ansvarar för webbplatsen eller marknadsföringen. När når jag dem?",
+   "mail": "Självklart skickar jag. Kan jag få adressen och vem jag ska ställa det till?",
+  },
+  "em_subj_nosite": "Gratis webbplatsskiss för «{biz}»",
+  "em_subj_weak": "Idéer för att förbättra {domain}",
+  "em_nosite": "Hej!\n\nJag heter {me}. Jag hittade «{biz}» på kartan och såg att ni saknar egen webbplats. De flesta kunder söker tjänster i Google med mobilen först, och en webbplats hjälper er att behålla dem.\n\nJag bygger webbplatser för lokala företag{pricep}. Jag kan gratis ta fram en skiss för «{biz}», utan förpliktelser.\n\nExempel på arbeten: {portfolio}\n\nOm det är intressant, svara bara på detta mejl.\n\nVänliga hälsningar,\n{me}\n{contact}",
+  "em_weak": "Hej!\n\nJag heter {me}. Jag tittade på webbplatsen för «{biz}» ({domain}) och märkte: {problem}. Det kan minska antalet förfrågningar.\n\nJag bygger webbplatser för lokala företag{pricep} och kan gratis ta fram en kort genomgång (1 sida) med konkreta förbättringar.\n\nExempel på arbeten: {portfolio}\n\nOm det är intressant, svara bara på detta mejl.\n\nVänliga hälsningar,\n{me}\n{contact}",
+  "fu": [
+   "Hej! Jag påminner om mitt meddelande om en webbplats för «{biz}». Om det inte passar just nu, säg bara till så stör jag inte. Om det är intressant skickar jag en skiss inom 1–2 dagar.",
+   "Detta är mitt sista meddelande. Jag har tagit fram en kort webbplatsplan för «{biz}». Ska jag skicka den? Annars önskar jag er lycka till med företaget!",
+  ],
+  "obj": {
+   "price": "Jag förstår. Låt mig först visa en gratis skiss, så kan ni avgöra om den är värd priset. Ofta betalar en eller två nya kunder tillbaka webbplatsen.",
+   "noneed": "Jag förstår. Många tycker så tills de ser hur många kunder som söker i Google. Jag kan gratis visa på två minuter hur ni syns jämfört med konkurrenterna.",
+   "think": "Självklart. För att göra det enkelt skickar jag skissen och en kort beskrivning. Passar tisdag eller torsdag för uppföljning?",
+   "have": "Vad bra att ni redan jobbar med det. Om ni vill skickar jag en gratis genomgång av nuvarande sajt som en andra åsikt, utan förpliktelser.",
+   "social": "Sociala medier är bra för uppmärksamhet, men kunder söker webbplatser i Google. Sajten kompletterar sociala medier i stället för att ersätta dem. Jag kan visa exempel.",
+   "fine": "Kul att ni är nöjda. Jag visar gratis hur sajten ser ut i mobilen och hur snabbt den laddar. Är allt bra säger jag det.",
+  },
+ },
+ "de": {
+  "and": " und ",
+  "prob": {
+   "mobile": "die Seite funktioniert auf dem Handy nicht gut",
+   "https": "die Seite hat keine sichere HTTPS-Verbindung",
+   "ssl": "es gibt ein Problem mit dem Sicherheitszertifikat der Seite",
+   "stub": "die Seite wirkt unfertig",
+   "old": "die Seite wirkt veraltet",
+   "slow": "die Seite lädt langsam",
+   "dead": "die Seite öffnet nicht",
+   "social": "statt einer Website gibt es nur eine Social-Media-Seite",
+   "seo": "der Seite fehlt die Beschreibung für Suchmaschinen",
+   "generic": "die Seite lässt sich deutlich verbessern",
+  },
+  "dm_nosite": [
+   "Hallo! Ich bin {me}. Ich habe «{biz}» auf der Karte gefunden, aber keine eigene Website. Die meisten Kunden suchen Leistungen heute zuerst bei Google am Handy. Ich baue Websites für lokale Unternehmen{pricep}. Ich kann Ihnen kostenlos einen Entwurf für «{biz}» zeigen, unverbindlich. Beispiele: {portfolio}. Soll ich ihn schicken?",
+   "Hallo! «{biz}» scheint keine Website zu haben. Ich baue welche für lokale Unternehmen und kann kostenlos einen Entwurf zeigen. Interesse?",
+  ],
+  "dm_weak": [
+   "Hallo! Ich bin {me}. Ich habe mir die Website von «{biz}» ({domain}) angesehen und bemerkt: {problem}. Dadurch können Kunden zur Konkurrenz gehen. Ich kann kostenlos eine einseitige Analyse mit Verbesserungen erstellen. Beispiele: {portfolio}. Soll ich sie schicken?",
+   "Hallo! Ich war auf {domain} und habe bemerkt: {problem}. Ich kann eine kurze kostenlose Analyse schicken. Interesse?",
+  ],
+  "call": {
+   "open": "Guten Tag! Mein Name ist {me}. Ich brauche nur eine Minute. Ist das «{biz}»?",
+   "hook_nosite": "Ich habe Sie auf der Karte gefunden, aber keine Website. Finden Kunden Sie heute online?",
+   "hook_weak": "Ich war auf Ihrer Website {domain} und habe bemerkt: {problem}. Ist Ihnen aufgefallen, dass dadurch Anfragen verloren gehen?",
+   "offer": "Ich baue Websites für lokale Unternehmen{pricep}. Ich kann kostenlos eine kurze Analyse oder einen Entwurf erstellen, unverbindlich.",
+   "close": "Soll ich es per WhatsApp oder E-Mail schicken? Oder telefonieren wir morgen 10 Minuten?",
+   "secretary": "Ich möchte mit der Person sprechen, die für Website oder Marketing zuständig ist. Wann ist sie erreichbar?",
+   "mail": "Natürlich schicke ich es. Nennen Sie mir bitte die Adresse und den Ansprechpartner.",
+  },
+  "em_subj_nosite": "Kostenloser Website-Entwurf für «{biz}»",
+  "em_subj_weak": "Ideen zur Verbesserung von {domain}",
+  "em_nosite": "Hallo!\n\nich bin {me}. Ich habe «{biz}» auf der Karte gefunden und gesehen, dass Sie keine eigene Website haben. Die meisten Kunden suchen Leistungen heute zuerst bei Google am Handy — eine Website hilft, sie nicht zu verlieren.\n\nIch baue Websites für lokale Unternehmen{pricep}. Ich kann kostenlos einen Entwurf für «{biz}» erstellen, unverbindlich.\n\nBeispiele meiner Arbeit: {portfolio}\n\nWenn es Sie interessiert, antworten Sie einfach auf diese E-Mail.\n\nFreundliche Grüße\n{me}\n{contact}",
+  "em_weak": "Hallo!\n\nich bin {me}. Ich habe mir die Website von «{biz}» ({domain}) angesehen und bemerkt: {problem}. Das kann die Zahl der Anfragen verringern.\n\nIch baue Websites für lokale Unternehmen{pricep} und kann kostenlos eine kurze Analyse (1 Seite) mit konkreten Verbesserungen erstellen.\n\nBeispiele meiner Arbeit: {portfolio}\n\nWenn es Sie interessiert, antworten Sie einfach auf diese E-Mail.\n\nFreundliche Grüße\n{me}\n{contact}",
+  "fu": [
+   "Hallo! Ich erinnere an meine Nachricht wegen einer Website für «{biz}». Wenn es gerade nicht passt, sagen Sie einfach Bescheid, dann störe ich nicht weiter. Bei Interesse schicke ich den Entwurf in 1–2 Tagen.",
+   "Dies ist meine letzte Nachricht. Ich habe einen kurzen Website-Plan für «{biz}» erstellt. Soll ich ihn schicken? Falls nicht, wünsche ich Ihnen viel Erfolg!",
+  ],
+  "obj": {
+   "price": "Ich verstehe. Ich zeige Ihnen zuerst kostenlos einen Entwurf, und Sie entscheiden, ob er den Preis wert ist. Oft bezahlen ein bis zwei neue Kunden die Website.",
+   "noneed": "Ich verstehe. Viele denken so, bis sie sehen, wie viele Kunden bei Google suchen. Ich kann Ihnen in zwei Minuten kostenlos zeigen, wie Sie im Vergleich zur Konkurrenz aussehen.",
+   "think": "Natürlich. Damit die Entscheidung leichter fällt, schicke ich den Entwurf und eine kurze Beschreibung. Passt Dienstag oder Donnerstag für ein Follow-up?",
+   "have": "Schön, dass Sie schon daran arbeiten. Wenn Sie möchten, schicke ich eine kostenlose Analyse der aktuellen Seite als zweite Meinung, unverbindlich.",
+   "social": "Social Media ist gut für Aufmerksamkeit, aber Kunden suchen Websites bei Google. Die Website ergänzt Social Media, statt sie zu ersetzen. Ich kann Beispiele zeigen.",
+   "fine": "Freut mich, dass Sie zufrieden sind. Ich zeige Ihnen kostenlos, wie die Seite am Handy aussieht und wie schnell sie lädt. Wenn alles gut ist, sage ich das auch.",
+  },
+ },
 }
-LANGS = [("ru", "🇷🇺 RU"), ("en", "🇬🇧 EN"), ("fi", "🇫🇮 FI")]
+LANGS = [("ru", "🇷🇺 RU"), ("en", "🇬🇧 EN"), ("fi", "🇫🇮 FI"),
+         ("et", "🇪🇪 ET"), ("sv", "🇸🇪 SV"), ("de", "🇩🇪 DE")]
 if DEFAULT_LANG not in T:
     DEFAULT_LANG = "ru"
 
@@ -315,12 +478,13 @@ _CACHE = {}
 CACHE_TTL = 30 * 60  # результаты живут полчаса
 
 
-def cache_store(key, mode, city, res):
-    token = hashlib.md5(f"{key}|{mode}|{city.lower()}".encode()).hexdigest()[:10]
+def cache_store(key, mode, city, res, flags=""):
+    token = hashlib.md5(f"{key}|{mode}|{city.lower()}|{flags}".encode()).hexdigest()[:10]
     now = time.time()
     for t in [t for t, v in _CACHE.items() if now - v["ts"] > CACHE_TTL]:
         _CACHE.pop(t, None)
-    _CACHE[token] = {"key": key, "mode": mode, "city": city, "res": res, "ts": now}
+    _CACHE[token] = {"key": key, "mode": mode, "city": city, "res": res,
+                     "flags": flags, "ts": now}
     return token
 
 
@@ -329,6 +493,164 @@ def cache_load(token):
     if v and time.time() - v["ts"] <= CACHE_TTL:
         return v
     return None
+
+
+# ---------- CRM: база клиентов в бесплатном Upstash Redis ----------
+def kv_cmd(*args):
+    req = urllib.request.Request(UPSTASH_URL, data=json.dumps(list(args)).encode(),
+                                 headers={"Authorization": "Bearer " + UPSTASH_TOKEN,
+                                          "Content-Type": "application/json"})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=8).read()).get("result")
+    except Exception as e:
+        print("kv error", e)
+        return None
+
+
+def lead_id(it):
+    return hashlib.md5(f"{it['name'].lower()}|{round(it['lat'], 4)}|{round(it['lon'], 4)}"
+                       .encode()).hexdigest()[:12]
+
+
+def crm_all():
+    if not CRM_ON:
+        return {}
+    raw = kv_cmd("GET", "crm")
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def crm_save(db):
+    kv_cmd("SET", "crm", json.dumps(db, ensure_ascii=False))
+
+
+CRM_LABEL = {"contacted": "✍️ написали", "deal": "🤝 сделка", "refused": "❌ отказ"}
+
+
+def crm_set(it, status):
+    db = crm_all()
+    rec = db.get(lead_id(it), {})
+    rec.update(name=it["name"], status=status, ts=int(time.time()),
+               site=it.get("site", ""), phone=it.get("phone", ""))
+    if status == "contacted":
+        rec["next"] = int(time.time()) + 3 * 86400  # напомнить через 3 дня
+        rec["fu"] = 1
+    else:
+        rec.pop("next", None)
+    db[lead_id(it)] = rec
+    crm_save(db)
+    return rec
+
+
+def crm_toggle_fav(it):
+    db = crm_all()
+    rec = db.get(lead_id(it), {})
+    rec.update(name=it["name"], site=it.get("site", ""), phone=it.get("phone", ""))
+    rec["fav"] = not rec.get("fav", False)
+    if not rec.get("status"):
+        rec["status"] = "new"
+    db[lead_id(it)] = rec
+    crm_save(db)
+    return rec
+
+
+# ---------- загрузка файлов в Telegram (CSV, скриншоты) ----------
+def tg_upload(method, fields, filename, content, field="document"):
+    boundary = "----leadradar" + hashlib.md5(str(time.time()).encode()).hexdigest()
+    body = b""
+    for k, v in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n"
+                 f"{v}\r\n").encode()
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; "
+             f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode()
+    body += content + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(API + method, data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=40).read()).get("result")
+    except Exception as e:
+        print("tg upload error", method, e)
+        return None
+
+
+def export_csv(chat_id, token):
+    hit = cache_load(token)
+    if not hit:
+        tg("sendMessage", chat_id=chat_id, text="Поиск устарел — запусти новый, и кнопка CSV появится снова.")
+        return
+    items = hit["res"][0]
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow(["Название", "Тип", "Балл", "Сайт", "Телефон", "Email", "Адрес", "Проблемы", "Карта"])
+    for it in items:
+        wr.writerow([it["name"], "нет сайта" if it["kind"] == "nosite" else "слабый сайт",
+                     it["score"], it["site"], it["phone"], it["email"], it["addr"],
+                     "; ".join(t for _, t in it["issues"]),
+                     f"https://www.google.com/maps/search/?api=1&query={it['lat']},{it['lon']}"])
+    fname = f"leads-{hit['key']}-{datetime.date.today().isoformat()}.csv"
+    ok = tg_upload("sendDocument", {"chat_id": str(chat_id),
+                                    "caption": f"📥 {len(items)} клиентов. Открывается в Excel / Google Sheets."},
+                   fname, buf.getvalue().encode("utf-8-sig"))
+    if not ok:
+        tg("sendMessage", chat_id=chat_id, text="⚠️ Не смог отправить файл, попробуй ещё раз.")
+
+
+# ---------- PageSpeed: точная скорость сайта от Google ----------
+def pagespeed(url):
+    api = ("https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url="
+           + urllib.parse.quote(url, safe="") + "&strategy=mobile&category=performance")
+    if PSI_KEY:
+        api += "&key=" + PSI_KEY
+    return get_json(api, timeout=50)
+
+
+def send_pagespeed(chat_id, it):
+    status = tg("sendMessage", chat_id=chat_id,
+                text=f"⏳ Замеряю скорость {it['site']} (Google PageSpeed, до 40 секунд)...")
+    try:
+        data = pagespeed(it["site"])
+    except Exception as e:
+        print("psi error", e)
+        data = None
+    if status:
+        delete_msg(chat_id, status["message_id"])
+    if not data or "lighthouseResult" not in data:
+        tg("sendMessage", chat_id=chat_id,
+           text="⚠️ Google не смог замерить этот сайт (закрыт от ботов или недоступен).")
+        return
+    lh = data["lighthouseResult"]
+    score = round((lh.get("categories", {}).get("performance", {}).get("score") or 0) * 100)
+    a = lh.get("audits", {})
+
+    def metric(key, fmt="{:.1f} с"):
+        v = a.get(key, {}).get("numericValue")
+        return fmt.format(v / 1000) if v is not None and "с" in fmt else (fmt.format(v) if v is not None else "—")
+
+    emoji = "🟢" if score >= 90 else "🟡" if score >= 50 else "🔴"
+    text = (f"🚀 <b>PageSpeed: {esc(it['name'])}</b>\n"
+            f"📱 Мобильная версия: <b>{emoji} {score}/100</b>\n\n"
+            f"• Первая отрисовка: {metric('first-contentful-paint')}\n"
+            f"• Основной контент: {metric('largest-contentful-paint')}\n"
+            f"• Блокировка скриптами: {metric('total-blocking-time', '{:.0f} мс')}\n"
+            f"• Сдвиги макета (CLS): {metric('cumulative-layout-shift', '{:.2f}')}\n\n")
+    if score < 50:
+        text += "💡 <i>Отличный аргумент для письма: «Ваш сайт набирает X/100 в Google PageSpeed, клиенты с телефона ждут Y секунд».</i>"
+    elif score < 90:
+        text += "💡 <i>Есть что улучшить — можно предложить точечную оптимизацию.</i>"
+    else:
+        text += "💡 <i>Скорость в порядке. Ищи другие проблемы: дизайн, SEO, мобильную версию.</i>"
+    shot = a.get("final-screenshot", {}).get("details", {}).get("data", "")
+    if shot.startswith("data:image"):
+        try:
+            img = base64.b64decode(shot.split(",", 1)[1])
+            tg_upload("sendPhoto", {"chat_id": str(chat_id), "caption": text[:1000],
+                                    "parse_mode": "HTML"}, "pagespeed.jpg", img, field="photo")
+            return
+        except Exception as e:
+            print("psi shot error", e)
+    tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 def get_json(url, data=None, timeout=25):
@@ -407,30 +729,89 @@ def analyze(url):
 
 
 # ---------- поиск на карте ----------
-def find_leads(niche_key, mode, city):
-    geo = get_json("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
-                   + urllib.parse.quote(city))
-    if not geo:
+def parse_city(text):
+    """«Helsinki» или «Helsinki, 10 км» -> (город, радиус_км или 0)."""
+    m = re.search(r"[,\s]+(\d{1,2})\s*(?:км|km)\s*$", text.strip(), re.I)
+    if m:
+        return text[:m.start()].strip(" ,"), min(int(m.group(1)), 50)
+    return text.strip(), 0
+
+
+def geocode(city):
+    """Координаты города. Nominatim, а если он недоступен — запасной Photon.
+    Возвращает (lat, lon, bbox), строку 'notfound' или None (сервисы легли)."""
+    answered = False
+    try:
+        geo = get_json("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
+                       + urllib.parse.quote(city), timeout=12)
+        answered = True
+        if geo:
+            s, n, w, e = map(float, geo[0]["boundingbox"])
+            return float(geo[0]["lat"]), float(geo[0]["lon"]), (s, w, n, e)
+    except Exception as e:
+        print("nominatim fail", e)
+    try:
+        geo = get_json("https://photon.komoot.io/api/?limit=1&q="
+                       + urllib.parse.quote(city), timeout=12)
+        answered = True
+        f = (geo.get("features") or [None])[0]
+        if f:
+            lon, lat = f["geometry"]["coordinates"]
+            ext = f.get("properties", {}).get("extent")
+            bbox = (ext[1], ext[0], ext[3], ext[2]) if ext else None
+            return lat, lon, bbox
+    except Exception as e:
+        print("photon fail", e)
+    return "notfound" if answered else None
+
+
+def find_leads(niche_key, mode, city, flags="---"):
+    """flags: p — только с телефоном, e — только с email, c — без сетей."""
+    city, radius = parse_city(city)
+    geo = geocode(city)
+    if geo == "notfound":
         return None
-    s, n, w, e = geo[0]["boundingbox"]
-    bbox = f"{s},{w},{n},{e}"
+    if geo is None:
+        raise RuntimeError("geocode down")
+    lat, lon, bbox = geo
+    if radius:
+        area = f"(around:{radius * 1000},{lat},{lon})"
+    else:
+        if bbox:
+            s, w, n, e = bbox
+            # у больших городов огромные границы — сужаем вокруг центра,
+            # чтобы карты отвечали быстро и не падали по таймауту
+            if n - s > 0.6:
+                s, n = lat - 0.3, lat + 0.3
+            if e - w > 0.6:
+                w, e = lon - 0.3, lon + 0.3
+        else:
+            s, w, n, e = lat - 0.15, lon - 0.15, lat + 0.15, lon + 0.15
+        area = f"({s},{w},{n},{e})"
     parts = ""
     for tag in NICHES[niche_key][1]:
         k, v = tag.split("=")
-        parts += f'nwr["{k}"="{v}"]["name"]({bbox});'
-    query = f"[out:json][timeout:20];({parts});out tags center 200;"
+        parts += f'nwr["{k}"="{v}"]["name"]{area};'
+    query = f"[out:json][timeout:15];({parts});out tags center 300;"
     data = None
     for ep in OVERPASS:
         try:
-            data = get_json(ep, data=urllib.parse.urlencode({"data": query}).encode())
+            data = get_json(ep, data=urllib.parse.urlencode({"data": query}).encode(), timeout=20)
             break
         except Exception as e:
             print("overpass fail", ep, e)
     if data is None:
         raise RuntimeError("overpass down")
 
+    elements = data.get("elements", [])
+    name_counts = {}
+    if "c" in flags:  # сеть = одно и то же название встречается 3+ раз
+        for el in elements:
+            nm = el.get("tags", {}).get("name", "").strip().lower()
+            name_counts[nm] = name_counts.get(nm, 0) + 1
+
     nosite, with_site, seen = [], [], set()
-    for el in data.get("elements", []):
+    for el in elements:
         t = el.get("tags", {})
         lat = el.get("lat") or el.get("center", {}).get("lat")
         lon = el.get("lon") or el.get("center", {}).get("lon")
@@ -440,6 +821,8 @@ def find_leads(niche_key, mode, city):
         if dup in seen:  # OSM часто отдаёт один объект дважды (node + way)
             continue
         seen.add(dup)
+        if "c" in flags and name_counts.get(t["name"].strip().lower(), 0) >= 3:
+            continue
         site = t.get("website") or t.get("contact:website") or t.get("url") or ""
         site = site.split(";")[0].strip()
         if site and not site.startswith("http"):
@@ -451,6 +834,10 @@ def find_leads(niche_key, mode, city):
             "addr": (t.get("addr:street", "") + " " + t.get("addr:housenumber", "")).strip(),
             "score": 0, "issues": [],
         }
+        if "p" in flags and not it["phone"]:
+            continue
+        if "e" in flags and not it["email"]:
+            continue
         (with_site if site else nosite).append(it)
 
     nosite.sort(key=lambda x: (not x["phone"], not x["email"]))
@@ -502,21 +889,45 @@ def send_menu(chat_id):
         remember(chat_id, "menu", m["message_id"])  # старое меню удалится само
 
 
-def modes_markup(key):
-    btns = [{"text": MODES[m], "callback_data": f"m|{key}|{m}"} for m in ("n", "w", "a")]
-    return {"inline_keyboard": [[btns[0], btns[1]], [btns[2]]]}
+def modes_markup(key, flags=""):
+    btns = [{"text": MODES[m], "callback_data": f"m|{key}|{m}|{flags}"} for m in ("n", "w", "a")]
+
+    def toggle(ch):
+        return flags.replace(ch, "") if ch in flags else flags + ch
+
+    def tog_btn(ch, label):
+        return {"text": label + (" ✅" if ch in flags else ""),
+                "callback_data": f"f|{key}|{toggle(ch)}"}
+
+    return {"inline_keyboard": [
+        [btns[0], btns[1]], [btns[2]],
+        [tog_btn("p", "📞 Только с телефоном"), tog_btn("e", "✉️ Только с email")],
+        [tog_btn("c", "🏪 Без сетей и франшиз")],
+    ]}
 
 
-def prompt_text(key, mode):
-    return (f"🔎 Ниша: {NICHES[key][0]}\n🎯 Режим: {MODES[mode]}\n\n"
-            "Напиши город ответом на это сообщение")
+def modes_text(key, flags=""):
+    fl = [lbl for ch, lbl in (("p", "только с телефоном"), ("e", "только с email"),
+                              ("c", "без сетей")) if ch in flags]
+    return (f"Ниша: {NICHES[key][0]}\nЧто ищем?" +
+            ("\n🧰 Фильтры: " + ", ".join(fl) if fl else ""))
 
 
-def send_prompt(chat_id, key, mode):
+def prompt_text(key, mode, flags=""):
+    fl = [lbl for ch, lbl in (("p", "только с телефоном"), ("e", "только с email"),
+                              ("c", "без сетей")) if ch in flags]
+    return (f"🔎 Ниша: {NICHES[key][0]}\n🎯 Режим: {MODES[mode]}" +
+            ("\n🧰 Фильтры: " + ", ".join(fl) if fl else "") +
+            "\n\nНапиши город ответом на это сообщение.\n"
+            "Можно с радиусом: «Helsinki, 10 км»")
+
+
+def send_prompt(chat_id, key, mode, flags=""):
     # force_reply нельзя поставить через редактирование, поэтому шлём новое сообщение,
     # а старое (выбор режима) удаляем — в чате ничего не копится
-    m = tg("sendMessage", chat_id=chat_id, text=prompt_text(key, mode),
-           reply_markup={"force_reply": True, "input_field_placeholder": "Например: Helsinki"})
+    m = tg("sendMessage", chat_id=chat_id, text=prompt_text(key, mode, flags),
+           reply_markup={"force_reply": True,
+                         "input_field_placeholder": "Например: Helsinki или Turku, 10 км"})
     if m:
         remember(chat_id, "flow", m["message_id"])
 
@@ -527,7 +938,7 @@ def send_tips(chat_id):
         remember(chat_id, "tips", m["message_id"])
 
 
-def send_card(chat_id, it, city):
+def send_card(chat_id, it, city, token=None, idx=0, db=None):
     text = f"<b>{esc(it['name'])}</b>"
     if it["kind"] == "nosite":
         text += "  🚫 нет сайта\n"
@@ -544,37 +955,53 @@ def send_card(chat_id, it, city):
     if it["email"]:
         text += f"✉️ {esc(it['email'])}\n"
     text += "💡 <i>Предложи: " + esc(", ".join(PITCH[k] for k in pitch_keys[:3])) + "</i>"
+    rec = (db or {}).get(lead_id(it))
+    if rec:
+        mark = CRM_LABEL.get(rec.get("status"), "")
+        if rec.get("fav"):
+            mark = ("⭐ " + mark).strip()
+        if mark:
+            text += f"\n📌 {mark}"
 
-    row1 = [{"text": "📍 На карте", "style": "primary",
+    row1 = [{"text": "📍 На карте",
              "url": f"https://www.google.com/maps/search/?api=1&query={it['lat']},{it['lon']}"}]
     if it["kind"] == "weak":
-        row1.append({"text": "🌐 Открыть сайт", "style": "danger", "url": it["site"]})
+        row1.append({"text": "🌐 Открыть сайт", "url": it["site"]})
     else:
-        row1.append({"text": "🔎 Проверить в Google", "style": "danger",
+        row1.append({"text": "🔎 Проверить в Google",
                      "url": "https://www.google.com/search?q=" + urllib.parse.quote(f"{it['name']} {city}")})
     rows = [row1]
     digits = "".join(c for c in it["phone"] if c.isdigit())
     if it["phone"].startswith("+") and len(digits) >= 8:
-        rows.append([{"text": "💬 Написать в WhatsApp", "style": "success",
+        rows.append([{"text": "💬 Написать в WhatsApp",
                       "url": f"https://wa.me/{digits}"}])
-    rows.append([{"text": "✍️ Скрипты и подсказки", "style": "success", "callback_data": "t|o"}])
+    if token is not None:
+        if it["kind"] == "weak":
+            rows.append([{"text": "🖼 Скриншот сайта", "callback_data": f"v|{token}|{idx}|shot"},
+                         {"text": "🚀 Скорость (Google)", "callback_data": f"v|{token}|{idx}|ps"}])
+        if CRM_ON:
+            rows.append([{"text": "✅ Написал", "callback_data": f"c|{token}|{idx}|contacted"},
+                         {"text": "🤝 Сделка", "callback_data": f"c|{token}|{idx}|deal"}])
+            rows.append([{"text": "❌ Отказ", "callback_data": f"c|{token}|{idx}|refused"},
+                         {"text": "⭐ В избранное", "callback_data": f"c|{token}|{idx}|fav"}])
+    rows.append([{"text": "✍️ Скрипты и подсказки", "callback_data": "t|o"}])
     tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
        disable_web_page_preview=True, reply_markup={"inline_keyboard": rows})
 
 
-def run_search(chat_id, key, mode, city, offset, token=None, cleanup=()):
+def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags=""):
     city = " ".join(city.split())[:80]
     res, fresh = None, False
     if offset > 0 and token:
         hit = cache_load(token)  # листаем страницы — поиск уже сделан, берём из кэша
         if hit and hit["key"] == key and hit["mode"] == mode:
-            res, city = hit["res"], hit["city"]
+            res, city, flags = hit["res"], hit["city"], hit.get("flags", "")
     if res is None:
         fresh = True
         status = tg("sendMessage", chat_id=chat_id,
                     text="⏳ Ищу и проверяю сайты, это может занять до 30 секунд...")
         try:
-            res = find_leads(key, mode, city)
+            res = find_leads(key, mode, city, flags)
         except Exception as e:
             print("search error", e)
             res = "error"
@@ -583,27 +1010,35 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=()):
     for mid in cleanup:  # сообщение пользователя с городом и подсказка "напиши город"
         delete_msg(chat_id, mid)
     if res == "error":
-        tg("sendMessage", chat_id=chat_id, text="⚠️ Карты не ответили, попробуй ещё раз через минуту.")
+        tg("sendMessage", chat_id=chat_id,
+           text="⚠️ Серверы карт сейчас перегружены. Я пробовал несколько запасных — "
+                "попробуй ещё раз через минуту, обычно помогает.")
         return
     if res is None:
-        tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷")
+        tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷 Проверь название или напиши по-английски.")
         return send_menu(chat_id)
     items, n_no, n_weak, n_with = res
+    db = crm_all()
+    if CRM_ON:  # уже обработанных клиентов в поиске больше не показываем
+        items = [it for it in items
+                 if db.get(lead_id(it), {}).get("status") not in ("contacted", "deal", "refused")]
     if fresh:
-        token = cache_store(key, mode, city, res)
+        token = cache_store(key, mode, city, res, flags)
         tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
            text=(f"📊 <b>{esc(city)}</b>, {NICHES[key][0]}\n"
                  f"🚫 без сайта: <b>{n_no}</b>\n"
                  f"🐌 слабых сайтов: <b>{n_weak}</b> (проверено до {MAX_ANALYZE} из {n_with})"))
     if not items:
-        tg("sendMessage", chat_id=chat_id, text="Подходящих не нашёл. Попробуй другую нишу или режим.")
+        tg("sendMessage", chat_id=chat_id,
+           text="Подходящих не нашёл (или все уже в твоей базе ✅). Попробуй другую нишу, режим или фильтры.")
         return send_menu(chat_id)
-    for it in items[offset:offset + PAGE]:
-        send_card(chat_id, it, city)
+    for i, it in enumerate(items[offset:offset + PAGE], start=offset):
+        send_card(chat_id, it, city, token=token, idx=i, db=db)
     end = min(offset + PAGE, len(items))
     buttons = []
     if end < len(items):
-        buttons.append({"text": "➡️ Ещё", "callback_data": f"p|{key}|{mode}|{token}|{end}"})
+        buttons.append({"text": "➡️ Ещё", "callback_data": f"p|{key}|{mode}|{token}|{end}|{flags}"})
+    buttons.append({"text": "📥 CSV", "callback_data": f"e|{token}"})
     buttons.append({"text": "🔄 Меню", "callback_data": "menu"})
     pager = tg("sendMessage", chat_id=chat_id, text=f"Показано {offset + 1}–{end} из {len(items)}",
                reply_markup={"inline_keyboard": [buttons]})
@@ -726,16 +1161,17 @@ def body_fu(ctx):
 
 
 def panel_markup(ctx):
-    lang_row = [{"text": ("✅ " if code == ctx["lang"] else "") + label, "callback_data": f"t|L|{code}"}
-                for code, label in LANGS]
+    lang_btns = [{"text": ("✅ " if code == ctx["lang"] else "") + label, "callback_data": f"t|L|{code}"}
+                 for code, label in LANGS]
     return {"inline_keyboard": [
-        [{"text": "📱 Директ / WhatsApp", "callback_data": "t|c|dm", "style": "primary"},
-         {"text": "📞 Звонок", "callback_data": "t|c|call", "style": "success"}],
-        [{"text": "✉️ Email", "callback_data": "t|c|em", "style": "primary"},
-         {"text": "🔁 Follow-up", "callback_data": "t|c|fu", "style": "success"}],
-        [{"text": "🛡 Возражения", "callback_data": "t|x", "style": "danger"},
-         {"text": "📋 План сделки", "callback_data": "t|p", "style": "primary"}],
-        lang_row,
+        [{"text": "📱 Директ / WhatsApp", "callback_data": "t|c|dm"},
+         {"text": "📞 Звонок", "callback_data": "t|c|call"}],
+        [{"text": "✉️ Email", "callback_data": "t|c|em"},
+         {"text": "🔁 Follow-up", "callback_data": "t|c|fu"}],
+        [{"text": "🛡 Возражения", "callback_data": "t|x"},
+         {"text": "📋 План сделки", "callback_data": "t|p"}],
+        lang_btns[:3],
+        lang_btns[3:],
     ]}
 
 
@@ -809,9 +1245,74 @@ def handle_tools(cb):
 
 HELP_TEXT = ("👋 <b>Бот для поиска клиентов</b>\n\n"
              "Ищет на карте бизнесы без сайта и со слабым сайтом, оценивает сайты и даёт готовые тексты "
-             "для директа, звонка и email на русском, английском и финском. Ещё подсказывает, как отвечать на "
+             "для директа, звонка и email на 6 языках (RU, EN, FI, ET, SV, DE). Ещё подсказывает, как отвечать на "
              "возражения и вести клиента до сделки.\n\n"
-             "/start — меню\n/tips — советы по продажам\n/me — твои данные для текстов\n\nПоехали 👇")
+             "/start — меню\n/tips — советы по продажам\n/me — твои данные для текстов\n"
+             "/stats — база клиентов и напоминания\n/fav — избранное\n\n"
+             "Под карточкой: 🖼 скриншот сайта, 🚀 скорость от Google, 📥 CSV-выгрузка.\n\nПоехали 👇")
+
+CRM_HINT = ("📒 <b>База клиентов не подключена</b>\n\n"
+            "Чтобы отмечать «✅ Написал / 🤝 Сделка / ❌ Отказ», вести избранное и получать "
+            "напоминания о follow-up:\n"
+            "1. Зарегистрируйся на upstash.com (бесплатно) и создай Redis-базу.\n"
+            "2. В Vercel → Environment Variables добавь:\n"
+            "UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN (из панели Upstash)\n"
+            "MY_CHAT_ID — твой chat id (узнать: @userinfobot)\n"
+            "3. Redeploy. Кнопки появятся под карточками сами.")
+
+
+def send_stats(chat_id):
+    if not CRM_ON:
+        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML")
+    else:
+        db = crm_all()
+        now = int(time.time())
+        cnt = {"contacted": 0, "deal": 0, "refused": 0}
+        due, fav = [], 0
+        for r in db.values():
+            if r.get("status") in cnt:
+                cnt[r["status"]] += 1
+            if r.get("fav"):
+                fav += 1
+            if r.get("next") and r["next"] <= now + 86400:
+                due.append(r["name"])
+        text = (f"📒 <b>Твоя база клиентов</b>\n\n"
+                f"✍️ Написали: <b>{cnt['contacted']}</b>\n"
+                f"🤝 Сделки: <b>{cnt['deal']}</b>\n"
+                f"❌ Отказы: <b>{cnt['refused']}</b>\n"
+                f"⭐ Избранное: <b>{fav}</b>\n\n")
+        if due:
+            text += "🔁 <b>Пора напомнить о себе:</b>\n" + "\n".join("• " + esc(n) for n in due[:15])
+        else:
+            text += "🔁 Напоминаний на ближайшие сутки нет."
+        m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+    if m:
+        remember(chat_id, "stats", m["message_id"])
+
+
+def send_fav(chat_id):
+    if not CRM_ON:
+        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML")
+    else:
+        favs = [r for r in crm_all().values() if r.get("fav")]
+        if not favs:
+            text = "⭐ Избранное пусто. Нажимай «⭐ В избранное» под карточкой клиента."
+        else:
+            text = "⭐ <b>Избранные клиенты</b>\n\n"
+            for r in favs[:30]:
+                line = f"• <b>{esc(r['name'])}</b>"
+                if r.get("site"):
+                    line += f" — {esc(r['site'])}"
+                if r.get("phone"):
+                    line += f" 📞 {esc(r['phone'])}"
+                mark = CRM_LABEL.get(r.get("status"))
+                if mark:
+                    line += f" ({mark})"
+                text += line + "\n"
+        m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+               disable_web_page_preview=True)
+    if m:
+        remember(chat_id, "fav", m["message_id"])
 
 
 def handle(update):
@@ -820,7 +1321,7 @@ def handle(update):
         tg("answerCallbackQuery", callback_query_id=cb["id"])
         chat_id = cb["message"]["chat"]["id"]
         data = cb.get("data", "")
-        parts = data.split("|", 4)
+        parts = data.split("|")
         mid = cb["message"]["message_id"]
         if data.startswith("t|"):
             handle_tools(cb)
@@ -837,14 +1338,17 @@ def handle(update):
             send_tips(chat_id)
         elif parts[0] == "n" and parts[1] in NICHES:
             # выбор режима редактирует меню на месте
-            if not edit_msg(chat_id, mid, f"Ниша: {NICHES[parts[1]][0]}\nЧто ищем?",
-                            modes_markup(parts[1])):
-                tg("sendMessage", chat_id=chat_id, text=f"Ниша: {NICHES[parts[1]][0]}\nЧто ищем?",
+            if not edit_msg(chat_id, mid, modes_text(parts[1]), modes_markup(parts[1])):
+                tg("sendMessage", chat_id=chat_id, text=modes_text(parts[1]),
                    reply_markup=modes_markup(parts[1]))
+        elif parts[0] == "f" and parts[1] in NICHES:
+            # переключили фильтр — перерисовываем то же сообщение
+            flags = parts[2] if len(parts) > 2 else ""
+            edit_msg(chat_id, mid, modes_text(parts[1], flags), modes_markup(parts[1], flags))
         elif parts[0] == "m" and parts[1] in NICHES and parts[2] in MODES:
             delete_msg(chat_id, mid)  # выбор режима больше не нужен
-            send_prompt(chat_id, parts[1], parts[2])
-        elif parts[0] == "p" and len(parts) == 5 and parts[1] in NICHES and parts[2] in MODES:
+            send_prompt(chat_id, parts[1], parts[2], parts[3] if len(parts) > 3 else "")
+        elif parts[0] == "p" and len(parts) == 6 and parts[1] in NICHES and parts[2] in MODES:
             try:
                 offset = int(parts[4])
             except ValueError:
@@ -855,7 +1359,49 @@ def handle(update):
             else:
                 # кэш остыл (прошло >30 минут или перезапуск) — просто спросим город заново
                 delete_msg(chat_id, mid)
-                send_prompt(chat_id, parts[1], parts[2])
+                send_prompt(chat_id, parts[1], parts[2], parts[5])
+        elif parts[0] == "e" and len(parts) == 2:
+            export_csv(chat_id, parts[1])
+        elif parts[0] == "v" and len(parts) == 4:
+            hit = cache_load(parts[1])
+            try:
+                it = hit["res"][0][int(parts[2])] if hit else None
+            except (ValueError, IndexError):
+                it = None
+            if not it:
+                tg("sendMessage", chat_id=chat_id, text="Поиск устарел — запусти новый.")
+                return
+            if parts[3] == "shot":
+                ok = tg("sendPhoto", chat_id=chat_id,
+                        photo="https://image.thum.io/get/width/800/noanimate/" + it["site"],
+                        caption=f"🖼 {it['name']} — {it['site']}")
+                if not ok:
+                    tg("sendMessage", chat_id=chat_id,
+                       text="⚠️ Скриншот не получился (сайт закрыт от ботов). Открой его кнопкой «Открыть сайт».")
+            elif parts[3] == "ps":
+                send_pagespeed(chat_id, it)
+        elif parts[0] == "c" and len(parts) == 4 and CRM_ON:
+            hit = cache_load(parts[1])
+            try:
+                it = hit["res"][0][int(parts[2])] if hit else None
+            except (ValueError, IndexError):
+                it = None
+            if not it:
+                tg("sendMessage", chat_id=chat_id, text="Поиск устарел — запусти новый.")
+                return
+            if parts[3] == "fav":
+                rec = crm_toggle_fav(it)
+                mark = "⭐ добавлено в избранное" if rec.get("fav") else "☆ убрано из избранного"
+            elif parts[3] in CRM_LABEL:
+                crm_set(it, parts[3])
+                mark = CRM_LABEL[parts[3]]
+                if parts[3] == "contacted":
+                    mark += " · напомню через 3 дня"
+            else:
+                return
+            text = re.sub(r"\n📌[^\n]*", "", cb["message"].get("text", "")) + "\n📌 " + mark
+            tg("editMessageText", chat_id=chat_id, message_id=mid, text=text, parse_mode="HTML",
+               reply_markup=cb["message"].get("reply_markup"), disable_web_page_preview=True)
         return
 
     msg = update.get("message")
@@ -868,6 +1414,10 @@ def handle(update):
 
     if text.startswith("/tips"):
         return send_tips(chat_id)
+    if text.startswith("/stats"):
+        return send_stats(chat_id)
+    if text.startswith("/fav"):
+        return send_fav(chat_id)
     if text.startswith("/me"):
         m = tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
                text=("⚙️ <b>Твои данные в текстах</b>\n"
@@ -894,9 +1444,11 @@ def handle(update):
     if reply_text.startswith("🔎 Ниша:") and not text.startswith("/"):
         key = next((k for k, (lbl, _) in NICHES.items() if lbl in reply_text), None)
         mode = next((m for m, lbl in MODES.items() if lbl in reply_text), None)
+        flags = "".join(ch for ch, lbl in (("p", "только с телефоном"), ("e", "только с email"),
+                                           ("c", "без сетей")) if lbl in reply_text)
         if key and mode:
             # после поиска удаляем сообщение с городом и подсказку "напиши город"
-            return run_search(chat_id, key, mode, text, 0,
+            return run_search(chat_id, key, mode, text, 0, flags=flags,
                               cleanup=(msg["message_id"], reply.get("message_id")))
     send_menu(chat_id)
 

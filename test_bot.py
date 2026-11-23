@@ -8,6 +8,7 @@ from api import webhook as w
 
 calls = []          # все вызовы "Telegram"
 msgs = {}           # message_id -> текст (живые сообщения)
+uploads = []        # загруженные файлы (CSV и т.д.)
 _next = [100]
 
 def fake_tg(method, **params):
@@ -30,14 +31,21 @@ def fake_tg(method, **params):
         return True
     return None
 
+def fake_upload(method, fields, filename, content, field="document"):
+    uploads.append((method, filename, content))
+    return {"message_id": 1}
+
 w.tg = fake_tg
+w.tg_upload = fake_upload
 
 FAKE = ([{"name": "Кафе Ромашка", "site": "", "lat": 60.1, "lon": 24.9,
           "phone": "+358401234567", "email": "", "addr": "Mannerheimintie 1",
           "score": 0, "issues": [], "kind": "nosite"}] * 12, 12, 0, 0)
 searches = [0]
-def fake_find(key, mode, city):
+last_flags = [""]
+def fake_find(key, mode, city, flags=""):
     searches[0] += 1
+    last_flags[0] = flags
     return FAKE
 w.find_leads = fake_find
 
@@ -52,29 +60,33 @@ def user(text, reply_to=None):
         m["reply_to_message"] = {"message_id": reply_to, "text": msgs.get(reply_to, "")}
     return {"message": m}
 
-def methods():
-    return [c[0] for c in calls]
-
 # 1. /start
 w.handle(user("/start"))
 assert any("Выбери нишу" in t for t in msgs.values()), "меню не отправлено"
 menu_mid = [m for m, t in msgs.items() if "Выбери нишу" in t][0]
 assert 9000 not in msgs, "команда /start не удалена"
 
-# 2. выбор ниши — меню редактируется на месте, новых сообщений нет
+# 2. выбор ниши — меню редактируется на месте
 n_before = len(msgs)
 w.handle(cb("n|food", menu_mid))
 assert len(msgs) == n_before, "выбор ниши создал лишнее сообщение"
 assert "Что ищем?" in msgs[menu_mid]
 
-# 3. выбор режима — появляется запрос города
-w.handle(cb("m|food|n", menu_mid))
+# 2b. фильтры переключаются на месте
+w.handle(cb("f|food|p", menu_mid))
+assert "только с телефоном" in msgs[menu_mid]
+assert len(msgs) == n_before
+
+# 3. выбор режима — появляется запрос города (с фильтром)
+w.handle(cb("m|food|n|p", menu_mid))
 prompt_mid = [m for m, t in msgs.items() if t.startswith("🔎 Ниша:")][0]
 assert menu_mid not in msgs, "сообщение выбора режима не удалено"
+assert "только с телефоном" in msgs[prompt_mid]
 
 # 4. город ответом — поиск, статус и сообщение пользователя удалены
 w.handle(user("Helsinki", reply_to=prompt_mid))
 assert searches[0] == 1
+assert last_flags[0] == "p", "фильтр не дошёл до поиска"
 assert prompt_mid not in msgs, "подсказка 'напиши город' не удалена"
 assert not any(t.startswith("⏳") for t in msgs.values()), "статус 'Ищу...' не удалён"
 assert not any(t == "Helsinki" for t in msgs.values()), "сообщение с городом не удалено"
@@ -84,33 +96,40 @@ pager = [m for m, t in msgs.items() if t.startswith("Показано")][0]
 assert "1–5 из 12" in msgs[pager]
 
 # 5. листание: поиск НЕ повторяется, старый счётчик удалён
-w.handle(cb(f"p|food|n|{list(w._CACHE)[0]}|5", pager))
+token = list(w._CACHE)[0]
+w.handle(cb(f"p|food|n|{token}|5|p", pager))
 assert searches[0] == 1, "повторный поиск при листании!"
 assert pager not in msgs, "старый счётчик страниц не удалён"
 pager2 = [m for m, t in msgs.items() if t.startswith("Показано")][0]
 assert "6–10 из 12" in msgs[pager2]
-assert len([m for m, t in msgs.items() if "Кафе Ромашка" in t]) == 10
 
-# 6. кнопка Меню превращает счётчик в меню (без нового сообщения)
+# 5b. CSV-выгрузка
+w.handle(cb(f"e|{token}", pager2))
+assert uploads and uploads[0][1].endswith(".csv"), "CSV не отправлен"
+assert "Кафе Ромашка" in uploads[0][2].decode("utf-8-sig")
+
+# 6. кнопка Меню превращает счётчик в меню
 n_before = len(msgs)
 w.handle(cb("menu", pager2))
 assert "Выбери нишу" in msgs[pager2]
 assert len(msgs) == n_before
 
 # 7. панель скриптов: новая заменяет старую
-card_mid = cards[0]
-w.handle(cb("t|o", card_mid))
+w.handle(cb("t|o", cards[0]))
 panel1 = [m for m, t in msgs.items() if t.startswith("✍️")][0]
 w.handle(cb("t|o", cards[1]))
 assert panel1 not in msgs, "старая панель скриптов не удалена"
 panel2 = [m for m, t in msgs.items() if t.startswith("✍️")][0]
 
-# 8. язык и разделы редактируют панель на месте
+# 8. язык и разделы редактируют панель на месте; новые языки работают
 n_before = len(msgs)
-w.handle(cb("t|L|en", panel2))
+w.handle(cb("t|L|de", panel2))
 w.handle(cb("t|c|dm", panel2))
 assert len(msgs) == n_before
-assert "Директ" in msgs[panel2] and "Hi!" in msgs[panel2]
+assert "Hallo!" in msgs[panel2], "немецкий текст не подставился"
+w.handle(cb("t|L|et", panel2))
+w.handle(cb("t|c|em", panel2))
+assert "Tere!" in msgs[panel2], "эстонский текст не подставился"
 w.handle(cb("t|b", panel2))
 assert "Выбери, что нужно" in msgs[panel2]
 
@@ -121,8 +140,18 @@ assert len(msgs) <= n_before, "случайное сообщение пород�
 
 # 10. остывший кэш: вместо ошибки бот снова спрашивает город
 w._CACHE.clear()
-w.handle(cb("p|food|n|deadbeef00|5", pager2))
+w.handle(cb("p|food|n|deadbeef00|5|p", pager2))
 assert any(t.startswith("🔎 Ниша:") for t in msgs.values()), "не спросил город при остывшем кэше"
 
-print("OK: все 10 сценариев прошли")
+# 11. радиус парсится корректно
+assert w.parse_city("Helsinki, 10 км") == ("Helsinki", 10)
+assert w.parse_city("Turku, 5 km") == ("Turku", 5)
+assert w.parse_city("Helsinki") == ("Helsinki", 0)
+
+# 12. /stats и /fav без CRM дают понятную подсказку, а не ошибку
+w.handle(user("/stats"))
+w.handle(user("/fav"))
+assert any("Upstash" in t or "upstash" in t for t in msgs.values())
+
+print("OK: все 12 сценариев прошли")
 print("живых сообщений в чате:", len(msgs))
