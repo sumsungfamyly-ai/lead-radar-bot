@@ -43,7 +43,7 @@ CRM_ON = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 PAGE = 5            # карточек за раз
 WEAK_MIN = 30       # с какого балла сайт считается слабым
-MAX_ANALYZE = 60    # сколько сайтов проверять за один поиск
+MAX_ANALYZE = 80    # сколько сайтов проверять за один поиск
 
 NICHES = {
     "dentist": ("🦷 Стоматологии", ["amenity=dentist"]),
@@ -1010,7 +1010,7 @@ def find_leads(niche_key, mode, city, flags="", budget_s=45):
     for tag in NICHES[niche_key][1]:
         k, v = tag.split("=")
         parts += f'nwr["{k}"="{v}"]["name"]{area};'
-    query = f"[out:json][timeout:10];({parts});out tags center 600;"
+    query = f"[out:json][timeout:10];({parts});out tags center 1000;"
     payload = urllib.parse.urlencode({"data": query}).encode()
 
     stop = threading.Event()

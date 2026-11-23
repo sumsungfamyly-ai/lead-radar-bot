@@ -34,12 +34,12 @@ HTML = r"""<!doctype html>
 :root[data-font="large"] .hero-sub,
 :root[data-font="large"] .meta,
 :root[data-font="large"] .issues,
-:root[data-font="large"] .pitch{font-size:14px}
+:root[data-font="large"] .pitch{font-size:15px}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{scroll-behavior:smooth}
 [hidden]{display:none!important}
 body{margin:0;color:var(--text);
-  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   padding:0 14px calc(34px + env(safe-area-inset-bottom));
   background:radial-gradient(1200px 700px at 10% -10%,rgba(110,168,255,.18),transparent 50%),
              radial-gradient(900px 600px at 100% 0%,rgba(155,123,255,.14),transparent 45%),
@@ -131,13 +131,13 @@ section:not([hidden]){animation:screenIn .38s ease both}
 .card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--green)}
 .card.weak:before{background:var(--yellow)}
 @keyframes rise{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:none}}
-.card h3{margin:0 0 5px;font-size:16px;padding-right:64px}
+.card h3{margin:0 0 8px;font-size:19px;line-height:1.3;padding-right:8px}
 .badge{position:absolute;right:13px;top:14px;font-size:10px;font-weight:700;border-radius:999px;
   padding:4px 8px;background:rgba(79,208,168,.14);background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--green)}
 .card.weak .badge{background:rgba(231,196,119,.14);background:color-mix(in srgb,var(--yellow) 15%,transparent);color:var(--yellow)}
-.meta{color:var(--hint);font-size:12px;margin:3px 0}
-.issues{font-size:12px;color:var(--yellow);margin-top:6px}
-.pitch{font-size:12px;color:var(--hint);margin-top:7px;font-style:italic}
+.meta{color:var(--hint);font-size:14px;margin:4px 0;line-height:1.5}
+.issues{font-size:13px;color:var(--yellow);margin-top:8px;line-height:1.45}
+.pitch{font-size:13px;color:var(--hint);margin-top:8px;font-style:italic;line-height:1.45}
 .card-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
 .mini{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:12px;
   padding:10px 13px;font-size:13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px;
@@ -292,7 +292,7 @@ section:not([hidden]){animation:screenIn .38s ease both}
   color:var(--text);border-radius:9px;padding:5px 8px;font-size:11px;cursor:pointer;outline:none}
 .statusSel:focus{border-color:var(--accent)}
 .quick-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-.qbtn{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:7px 10px;font-size:12px;cursor:pointer;transition:.2s ease}
+.qbtn{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:10px 14px;font-size:13px;cursor:pointer;transition:.2s ease;min-height:42px}
 .qbtn:hover{transform:translateY(-1px)}
 .qbtn.on{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;box-shadow:0 6px 16px var(--glow)}
 .qbtn.danger.on{background:linear-gradient(135deg,#ff7a7a,#d94f4f)}
@@ -863,8 +863,7 @@ function renderCards(){
       .map(s=>'<a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.label||'ссылка')+'</a>').join('');
     const cur=statusKeys().indexOf(it.status)>=0?it.status:'new';
     el.innerHTML='<span class="badge">'+badge+'</span><h3>'+esc(it.name)+'</h3>'+
-      '<div class="card-toprow">'+(isNewItem(it)?'<span class="badge new-badge">✨ Новый</span>':'')+
-        '<select class="statusSel" data-prev="'+esc(cur)+'">'+statusOptions(cur)+'</select></div>'+
+      (isNewItem(it)?'<div style="margin-bottom:8px"><span class="badge new-badge">✨ Новый</span></div>':'')+
       (it.site?'<div class="meta">🌐 <a href="'+esc(it.site)+'" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">'+esc(it.site.replace(/^https?:\/\//,'').replace(/\/$/,''))+'</a></div>':'')+
       ((it.site && (Array.isArray(it.issues)?it.issues:[]).some(x=>String(x).indexOf('dead')>=0||String(x).indexOf('не открывается')>=0))?'<div class="meta" style="color:var(--yellow)">⚠️ Сайт есть, но сейчас может быть недоступен</div>':'')+
       (it.addr?'<div class="meta">📍 '+esc(it.addr)+'</div>':'')+
@@ -885,9 +884,7 @@ function renderCards(){
       (it.phone&&it.phone.startsWith('+')?'<a class="mini" href="https://wa.me/'+it.phone.replace(/\D/g,'')+'" target="_blank">💬 WhatsApp</a>':'')+
       '</div>';
     el.querySelector('[data-act=scripts]').onclick=()=>openScripts(i);
-    const sel=el.querySelector('.statusSel');
-    sel.onchange=()=>changeStatus(itemKey(it),it.name,it.site||'',sel.value,sel);
-    el.querySelectorAll('.qbtn').forEach(b=>b.onclick=()=>changeStatus(itemKey(it),it.name,it.site||'',b.dataset.qs,sel));
+    el.querySelectorAll('.qbtn').forEach(b=>b.onclick=()=>changeStatus(itemKey(it),it.name,it.site||'',b.dataset.qs,null));
     $('#cards').appendChild(el);
   });
   $('#more').hidden=from+5>=items.length||state.hidden;
