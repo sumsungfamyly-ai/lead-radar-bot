@@ -1,4 +1,4 @@
-import os, re, ssl, json, time, html, datetime
+import os, re, ssl, json, time, html, hashlib, datetime
 import urllib.request, urllib.parse, urllib.error
 import concurrent.futures as cf
 
@@ -260,13 +260,75 @@ GENERAL_TIPS = (
 
 
 # ---------- Telegram ----------
+def _strip_styles(m):
+    # Telegram не поддерживает поле "style" у кнопок — убираем лишний мусор из запроса
+    if isinstance(m, dict):
+        m.pop("style", None)
+        for v in m.values():
+            _strip_styles(v)
+    elif isinstance(m, list):
+        for v in m:
+            _strip_styles(v)
+
+
 def tg(method, **params):
+    if "reply_markup" in params:
+        _strip_styles(params["reply_markup"])
     req = urllib.request.Request(API + method, data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        urllib.request.urlopen(req, timeout=10).read()
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        return resp.get("result")
     except Exception as e:
         print("tg error", method, e)
+        return None
+
+
+def delete_msg(chat_id, message_id):
+    """Тихо удаляет сообщение (ошибки не страшны: сообщение могло уже быть удалено)."""
+    if message_id:
+        tg("deleteMessage", chat_id=chat_id, message_id=message_id)
+
+
+# Память о служебных сообщениях чата: новое сообщение того же типа заменяет старое,
+# чтобы чат не засорялся. Живёт, пока прогрет инстанс Vercel; при холодной старте
+# бот просто шлёт новое сообщение — ничего не ломается.
+_CHAT = {}
+
+
+def remember(chat_id, kind, message_id):
+    st = _CHAT.setdefault(chat_id, {})
+    old = st.get(kind)
+    st[kind] = message_id
+    if old and old != message_id:
+        delete_msg(chat_id, old)
+
+
+def edit_msg(chat_id, message_id, text, markup):
+    """Редактирует сообщение на месте (без нового сообщения в чате)."""
+    return bool(tg("editMessageText", chat_id=chat_id, message_id=message_id, text=text,
+                   parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True))
+
+
+# Кэш результатов поиска: листание страниц больше не запускает поиск заново.
+_CACHE = {}
+CACHE_TTL = 30 * 60  # результаты живут полчаса
+
+
+def cache_store(key, mode, city, res):
+    token = hashlib.md5(f"{key}|{mode}|{city.lower()}".encode()).hexdigest()[:10]
+    now = time.time()
+    for t in [t for t, v in _CACHE.items() if now - v["ts"] > CACHE_TTL]:
+        _CACHE.pop(t, None)
+    _CACHE[token] = {"key": key, "mode": mode, "city": city, "res": res, "ts": now}
+    return token
+
+
+def cache_load(token):
+    v = _CACHE.get(token)
+    if v and time.time() - v["ts"] <= CACHE_TTL:
+        return v
+    return None
 
 
 def get_json(url, data=None, timeout=25):
@@ -367,13 +429,17 @@ def find_leads(niche_key, mode, city):
     if data is None:
         raise RuntimeError("overpass down")
 
-    nosite, with_site = [], []
+    nosite, with_site, seen = [], [], set()
     for el in data.get("elements", []):
         t = el.get("tags", {})
         lat = el.get("lat") or el.get("center", {}).get("lat")
         lon = el.get("lon") or el.get("center", {}).get("lon")
         if lat is None:
             continue
+        dup = (t["name"].strip().lower(), round(lat, 4), round(lon, 4))
+        if dup in seen:  # OSM часто отдаёт один объект дважды (node + way)
+            continue
+        seen.add(dup)
         site = t.get("website") or t.get("contact:website") or t.get("url") or ""
         site = site.split(";")[0].strip()
         if site and not site.startswith("http"):
@@ -426,17 +492,39 @@ def menu_markup():
     return {"inline_keyboard": rows}
 
 
+MENU_TEXT = ("Выбери нишу бизнеса 👇\nЯ найду тех, у кого <b>нет сайта</b> или он <b>слабый</b>, "
+             "а под каждой карточкой дам готовые тексты и подсказки, как взять клиента.")
+
+
 def send_menu(chat_id):
-    tg("sendMessage", chat_id=chat_id, reply_markup=menu_markup(), parse_mode="HTML",
-       text="Выбери нишу бизнеса 👇\nЯ найду тех, у кого <b>нет сайта</b> или он <b>слабый</b>, "
-            "а под каждой карточкой дам готовые тексты и подсказки, как взять клиента.")
+    m = tg("sendMessage", chat_id=chat_id, reply_markup=menu_markup(), parse_mode="HTML", text=MENU_TEXT)
+    if m:
+        remember(chat_id, "menu", m["message_id"])  # старое меню удалится само
 
 
-def send_modes(chat_id, key):
-    btns = [{"text": MODES[m], "callback_data": f"m|{key}|{m}", "style": st}
-            for m, st in (("n", "success"), ("w", "danger"), ("a", "primary"))]
-    tg("sendMessage", chat_id=chat_id, text=f"Ниша: {NICHES[key][0]}\nЧто ищем?",
-       reply_markup={"inline_keyboard": [[btns[0], btns[1]], [btns[2]]]})
+def modes_markup(key):
+    btns = [{"text": MODES[m], "callback_data": f"m|{key}|{m}"} for m in ("n", "w", "a")]
+    return {"inline_keyboard": [[btns[0], btns[1]], [btns[2]]]}
+
+
+def prompt_text(key, mode):
+    return (f"🔎 Ниша: {NICHES[key][0]}\n🎯 Режим: {MODES[mode]}\n\n"
+            "Напиши город ответом на это сообщение")
+
+
+def send_prompt(chat_id, key, mode):
+    # force_reply нельзя поставить через редактирование, поэтому шлём новое сообщение,
+    # а старое (выбор режима) удаляем — в чате ничего не копится
+    m = tg("sendMessage", chat_id=chat_id, text=prompt_text(key, mode),
+           reply_markup={"force_reply": True, "input_field_placeholder": "Например: Helsinki"})
+    if m:
+        remember(chat_id, "flow", m["message_id"])
+
+
+def send_tips(chat_id):
+    m = tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML")
+    if m:
+        remember(chat_id, "tips", m["message_id"])
 
 
 def send_card(chat_id, it, city):
@@ -474,20 +562,35 @@ def send_card(chat_id, it, city):
        disable_web_page_preview=True, reply_markup={"inline_keyboard": rows})
 
 
-def run_search(chat_id, key, mode, city, offset):
-    if offset == 0:
-        tg("sendMessage", chat_id=chat_id, text="⏳ Ищу и проверяю сайты, это может занять до 30 секунд...")
-    try:
-        res = find_leads(key, mode, city)
-    except Exception as e:
-        print("search error", e)
+def run_search(chat_id, key, mode, city, offset, token=None, cleanup=()):
+    city = " ".join(city.split())[:80]
+    res, fresh = None, False
+    if offset > 0 and token:
+        hit = cache_load(token)  # листаем страницы — поиск уже сделан, берём из кэша
+        if hit and hit["key"] == key and hit["mode"] == mode:
+            res, city = hit["res"], hit["city"]
+    if res is None:
+        fresh = True
+        status = tg("sendMessage", chat_id=chat_id,
+                    text="⏳ Ищу и проверяю сайты, это может занять до 30 секунд...")
+        try:
+            res = find_leads(key, mode, city)
+        except Exception as e:
+            print("search error", e)
+            res = "error"
+        if status:  # статус больше не нужен — сразу убираем
+            delete_msg(chat_id, status["message_id"])
+    for mid in cleanup:  # сообщение пользователя с городом и подсказка "напиши город"
+        delete_msg(chat_id, mid)
+    if res == "error":
         tg("sendMessage", chat_id=chat_id, text="⚠️ Карты не ответили, попробуй ещё раз через минуту.")
         return
     if res is None:
         tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷")
         return send_menu(chat_id)
     items, n_no, n_weak, n_with = res
-    if offset == 0:
+    if fresh:
+        token = cache_store(key, mode, city, res)
         tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
            text=(f"📊 <b>{esc(city)}</b>, {NICHES[key][0]}\n"
                  f"🚫 без сайта: <b>{n_no}</b>\n"
@@ -500,12 +603,12 @@ def run_search(chat_id, key, mode, city, offset):
     end = min(offset + PAGE, len(items))
     buttons = []
     if end < len(items):
-        prefix = f"p|{key}|{mode}|{end}|"
-        c = city.encode()[:64 - len(prefix.encode())].decode(errors="ignore")
-        buttons.append({"text": "➡️ Ещё", "callback_data": prefix + c, "style": "success"})
-    buttons.append({"text": "🔄 Меню", "callback_data": "menu", "style": "primary"})
-    tg("sendMessage", chat_id=chat_id, text=f"Показано {offset + 1}–{end} из {len(items)}",
-       reply_markup={"inline_keyboard": [buttons]})
+        buttons.append({"text": "➡️ Ещё", "callback_data": f"p|{key}|{mode}|{token}|{end}"})
+    buttons.append({"text": "🔄 Меню", "callback_data": "menu"})
+    pager = tg("sendMessage", chat_id=chat_id, text=f"Показано {offset + 1}–{end} из {len(items)}",
+               reply_markup={"inline_keyboard": [buttons]})
+    if pager:
+        remember(chat_id, "pager", pager["message_id"])  # старый счётчик страниц удалится
 
 
 # =====================================================================
@@ -662,8 +765,10 @@ def handle_tools(cb):
 
     if act == "o":  # нажали на карточке
         ctx = parse_card(text)
-        tg("sendMessage", chat_id=chat_id, text=panel_text(ctx), parse_mode="HTML",
-           reply_markup=panel_markup(ctx), reply_to_message_id=cb["message"]["message_id"])
+        panel = tg("sendMessage", chat_id=chat_id, text=panel_text(ctx), parse_mode="HTML",
+                   reply_markup=panel_markup(ctx), reply_to_message_id=cb["message"]["message_id"])
+        if panel:
+            remember(chat_id, "panel", panel["message_id"])  # прошлая панель удалится
         return
     ctx = parse_header(text)
     if not ctx:
@@ -716,21 +821,41 @@ def handle(update):
         chat_id = cb["message"]["chat"]["id"]
         data = cb.get("data", "")
         parts = data.split("|", 4)
+        mid = cb["message"]["message_id"]
         if data.startswith("t|"):
             handle_tools(cb)
         elif parts[0] == "menu":
-            send_menu(chat_id)
+            # превращаем сообщение со счётчиком страниц в меню — без нового сообщения
+            st = _CHAT.setdefault(chat_id, {})
+            if st.get("pager") == mid:
+                st.pop("pager")
+            if edit_msg(chat_id, mid, MENU_TEXT, menu_markup()):
+                remember(chat_id, "menu", mid)
+            else:
+                send_menu(chat_id)
         elif parts[0] == "tips":
-            tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML")
+            send_tips(chat_id)
         elif parts[0] == "n" and parts[1] in NICHES:
-            send_modes(chat_id, parts[1])
+            # выбор режима редактирует меню на месте
+            if not edit_msg(chat_id, mid, f"Ниша: {NICHES[parts[1]][0]}\nЧто ищем?",
+                            modes_markup(parts[1])):
+                tg("sendMessage", chat_id=chat_id, text=f"Ниша: {NICHES[parts[1]][0]}\nЧто ищем?",
+                   reply_markup=modes_markup(parts[1]))
         elif parts[0] == "m" and parts[1] in NICHES and parts[2] in MODES:
-            tg("sendMessage", chat_id=chat_id,
-               text=f"🔎 Ниша: {NICHES[parts[1]][0]}\n🎯 Режим: {MODES[parts[2]]}\n\n"
-                    "Напиши город ответом на это сообщение",
-               reply_markup={"force_reply": True, "input_field_placeholder": "Например: Helsinki"})
+            delete_msg(chat_id, mid)  # выбор режима больше не нужен
+            send_prompt(chat_id, parts[1], parts[2])
         elif parts[0] == "p" and len(parts) == 5 and parts[1] in NICHES and parts[2] in MODES:
-            run_search(chat_id, parts[1], parts[2], parts[4], int(parts[3]))
+            try:
+                offset = int(parts[4])
+            except ValueError:
+                return
+            hit = cache_load(parts[3])
+            if hit:
+                run_search(chat_id, parts[1], parts[2], hit["city"], offset, token=parts[3])
+            else:
+                # кэш остыл (прошло >30 минут или перезапуск) — просто спросим город заново
+                delete_msg(chat_id, mid)
+                send_prompt(chat_id, parts[1], parts[2])
         return
 
     msg = update.get("message")
@@ -738,27 +863,41 @@ def handle(update):
         return
     chat_id, text = msg["chat"]["id"], msg["text"].strip()
 
+    if text.startswith("/"):
+        delete_msg(chat_id, msg["message_id"])  # команды пользователя не засоряют чат
+
     if text.startswith("/tips"):
-        return tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML")
+        return send_tips(chat_id)
     if text.startswith("/me"):
-        return tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
-                  text=("⚙️ <b>Твои данные в текстах</b>\n"
-                        f"Имя: {esc(ME)}\nКонтакт: {esc(CONTACT)}\nПортфолио: {esc(PORTFOLIO)}\n"
-                        f"Цена: {esc(PRICE or '— не указана')}\nЯзык по умолчанию: {DEFAULT_LANG.upper()}\n\n"
-                        "Меняются в Vercel: Settings → Environment Variables (MY_NAME, MY_CONTACT, "
-                        "MY_PORTFOLIO, MY_PRICE, DEFAULT_LANG), потом Redeploy."))
+        m = tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
+               text=("⚙️ <b>Твои данные в текстах</b>\n"
+                     f"Имя: {esc(ME)}\nКонтакт: {esc(CONTACT)}\nПортфолио: {esc(PORTFOLIO)}\n"
+                     f"Цена: {esc(PRICE or '— не указана')}\nЯзык по умолчанию: {DEFAULT_LANG.upper()}\n\n"
+                     "Меняются в Vercel: Settings → Environment Variables (MY_NAME, MY_CONTACT, "
+                     "MY_PORTFOLIO, MY_PRICE, DEFAULT_LANG), потом Redeploy."))
+        if m:
+            remember(chat_id, "me", m["message_id"])
+        return
     if text.startswith("/help"):
-        return tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        if m:
+            remember(chat_id, "help", m["message_id"])
+        return
     if text.startswith("/start"):
-        tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        if m:
+            remember(chat_id, "help", m["message_id"])
         return send_menu(chat_id)
 
-    reply_text = (msg.get("reply_to_message") or {}).get("text", "")
+    reply = msg.get("reply_to_message") or {}
+    reply_text = reply.get("text", "")
     if reply_text.startswith("🔎 Ниша:") and not text.startswith("/"):
         key = next((k for k, (lbl, _) in NICHES.items() if lbl in reply_text), None)
         mode = next((m for m, lbl in MODES.items() if lbl in reply_text), None)
         if key and mode:
-            return run_search(chat_id, key, mode, text, 0)
+            # после поиска удаляем сообщение с городом и подсказку "напиши город"
+            return run_search(chat_id, key, mode, text, 0,
+                              cleanup=(msg["message_id"], reply.get("message_id")))
     send_menu(chat_id)
 
 
