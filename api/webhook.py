@@ -457,7 +457,6 @@ GENERAL_TIPS, OBJECTIONS = _GENERAL_TIPS, _OBJECTIONS
 
 # ---------- Telegram ----------
 def _strip_styles(m):
-    # Telegram не поддерживает поле "style" у кнопок — убираем лишний мусор из запроса
     if isinstance(m, dict):
         m.pop("style", None)
         for v in m.values():
@@ -467,15 +466,46 @@ def _strip_styles(m):
             _strip_styles(v)
 
 
+def _has_style(m):
+    if isinstance(m, dict):
+        if "style" in m:
+            return True
+        return any(_has_style(v) for v in m.values())
+    if isinstance(m, list):
+        return any(_has_style(v) for v in m)
+    return False
+
+
 def tg(method, **params):
-    if "reply_markup" in params:
-        _strip_styles(params["reply_markup"])
-    req = urllib.request.Request(API + method, data=json.dumps(params).encode(),
-                                 headers={"Content-Type": "application/json"})
+    def _call(p):
+        req = urllib.request.Request(API + method, data=json.dumps(p).encode(),
+                                     headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=10).read()
+        return json.loads(resp)
+
     try:
-        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
-        return resp.get("result")
+        resp = _call(params)
+        if resp.get("ok"):
+            return resp.get("result")
+        # Если Telegram не принял style кнопок — повторяем без style
+        desc = str(resp.get("description") or "")
+        if "reply_markup" in params and _has_style(params["reply_markup"]) and "style" in desc.lower():
+            p2 = json.loads(json.dumps(params))
+            _strip_styles(p2.get("reply_markup"))
+            resp = _call(p2)
+            return resp.get("result")
+        print("tg error", method, desc)
+        return None
     except Exception as e:
+        # fallback: старый API мог упасть на неизвестном поле style
+        if "reply_markup" in params and _has_style(params["reply_markup"]):
+            try:
+                p2 = json.loads(json.dumps(params))
+                _strip_styles(p2.get("reply_markup"))
+                resp = _call(p2)
+                return resp.get("result")
+            except Exception:
+                pass
         print("tg error", method, e)
         return None
 
@@ -1107,22 +1137,24 @@ def find_leads(niche_key, mode, city, flags="", budget_s=45):
 
 # ---------- меню и карточки ----------
 def menu_markup():
-    rows, row = [], []
+    rows = []
+    if MINIAPP_URL:  # основа — мини-приложение
+        rows.append([{"text": "🚀 Открыть мини-приложение", "web_app": {"url": MINIAPP_URL}, "style": "primary"}])
+    row = []
     for i, (key, (label, _)) in enumerate(NICHES.items()):
-        row.append({"text": label, "callback_data": f"n|{key}", "style": STYLES[i % 3]})
+        row.append({"text": label, "callback_data": f"n|{key}", "style": "primary"})
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    if MINIAPP_URL:  # открывается внутри Telegram, без перехода в браузер
-        rows.append([{"text": "🚀 Открыть мини-приложение", "web_app": {"url": MINIAPP_URL}}])
     rows.append([{"text": "🎯 Советы по продажам", "callback_data": "tips", "style": "success"}])
     return {"inline_keyboard": rows}
 
 
-MENU_TEXT = ("Выбери нишу бизнеса 👇\nЯ найду тех, у кого <b>нет сайта</b> или он <b>слабый</b>, "
-             "а под каждой карточкой дам готовые тексты и подсказки, как взять клиента.")
+MENU_TEXT = ("🚀 <b>Mini App — основной режим</b>\n"
+             "Там поиск, карточки, скрипты, карта, воронка и история.\n\n"
+             "Выбери нишу бизнеса 👇 или открой мини-приложение — я найду тех, у кого <b>нет сайта</b> или он <b>слабый</b>.")
 
 
 def potential_text(n):
@@ -1188,8 +1220,8 @@ def send_prompt(chat_id, key, mode, flags=""):
 
 def send_tips(chat_id):
     m = tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML",
-           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
-                                              {"text": "❌ Закрыть", "callback_data": "del"}]]})
+           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu", "style": "primary"},
+                                              {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]})
     if m:
         remember(chat_id, "tips", m["message_id"])
 
@@ -1202,9 +1234,16 @@ def send_card(chat_id, it, city, token=None, idx=0, db=None):
     else:
         emoji = "🔴" if it["score"] >= 60 else "🟡"
         dom = urllib.parse.urlparse(it["site"]).netloc.replace("www.", "")
-        text += f"  {emoji} сайт {it['score']}/100\n🌐 {esc(dom)}\n"
-        text += "⚠️ " + esc("; ".join(t for _, t in it["issues"])) + "\n"
-        pitch_keys = list(dict.fromkeys(k for k, _ in it["issues"]))
+        site_url = esc(it.get("site") or "")
+        dead = any(k == "dead" for k, _ in it.get("issues", []))
+        text += f"  {emoji} сайт {it['score']}/100\n"
+        text += f"🌐 <a href=\"{site_url}\">{esc(dom)}</a>\n"
+        if dead:
+            text += "⚠️ Сайт есть, но сейчас может не открываться — ссылку всё равно даю выше.\n"
+        issues_txt = "; ".join(t for _, t in it.get("issues", []))
+        if issues_txt:
+            text += "⚠️ " + esc(issues_txt) + "\n"
+        pitch_keys = list(dict.fromkeys(k for k, _ in it.get("issues", [])))
     if it["addr"]:
         text += f"📍 {esc(it['addr'])}\n"
     text += f"📞 {esc(it['phone'])}\n" if it["phone"] else "📞 телефона нет\n"
@@ -1282,8 +1321,8 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
         tg("sendMessage", chat_id=chat_id,
            text="⚠️ Все серверы карт сейчас перегружены — я пробовал 4 запасных и основной API OSM. "
                 "Это временно: подожди 1–2 минуты и повтори поиск.",
-           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
-                                              {"text": "❌ Закрыть", "callback_data": "del"}]]})
+           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu", "style": "primary"},
+                                              {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]})
         return
     if res is None:
         tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷 Проверь название или напиши по-английски.")
@@ -1330,7 +1369,7 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
         buttons.append({"text": "➡️ Ещё", "callback_data": f"p|{key}|{mode}|{token}|{end}|{flags}"})
     buttons.append({"text": "🙈 Скрыть", "callback_data": f"hide|{token}"})
     buttons.append({"text": "📥 CSV", "callback_data": f"e|{token}"})
-    buttons.append({"text": "🔄 Меню", "callback_data": "menu"})
+    buttons.append({"text": "🔄 Меню", "callback_data": "menu", "style": "primary"})
     pager = tg("sendMessage", chat_id=chat_id, text=f"Показано {offset + 1}–{end} из {len(items)}",
                reply_markup={"inline_keyboard": [buttons]})
     if pager:
@@ -1452,19 +1491,19 @@ def body_fu(ctx):
 
 
 def panel_markup(ctx):
-    lang_btns = [{"text": ("✅ " if code == ctx["lang"] else "") + label, "callback_data": f"t|L|{code}"}
+    lang_btns = [{"text": ("✅ " if code == ctx["lang"] else "") + label, "callback_data": f"t|L|{code}", "style": "primary"}
                  for code, label in LANGS]
     return {"inline_keyboard": [
-        [{"text": "📱 Директ / WhatsApp", "callback_data": "t|c|dm"},
-         {"text": "📞 Звонок", "callback_data": "t|c|call"}],
-        [{"text": "✉️ Email", "callback_data": "t|c|em"},
-         {"text": "🔁 Follow-up", "callback_data": "t|c|fu"}],
-        [{"text": "🛡 Возражения", "callback_data": "t|x"},
-         {"text": "📋 План сделки", "callback_data": "t|p"}],
-        [{"text": "🤝 Закрыть сделку", "callback_data": "t|z"}],
+        [{"text": "📱 Директ / WhatsApp", "callback_data": "t|c|dm", "style": "primary"},
+         {"text": "📞 Звонок", "callback_data": "t|c|call", "style": "primary"}],
+        [{"text": "✉️ Email", "callback_data": "t|c|em", "style": "primary"},
+         {"text": "🔁 Follow-up", "callback_data": "t|c|fu", "style": "primary"}],
+        [{"text": "🛡 Возражения", "callback_data": "t|x", "style": "success"},
+         {"text": "📋 План сделки", "callback_data": "t|p", "style": "success"}],
+        [{"text": "🤝 Закрыть сделку", "callback_data": "t|z", "style": "success"}],
         lang_btns[:3],
         lang_btns[3:],
-        [{"text": "❌ Закрыть", "callback_data": "del"}],
+        [{"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}],
     ]}
 
 
@@ -1478,7 +1517,7 @@ def back_markup(extra=None):
     if extra:
         row.append(extra)
     row.append({"text": "⬅️ Назад", "callback_data": "t|b", "style": "primary"})
-    row.append({"text": "❌ Закрыть", "callback_data": "del"})
+    row.append({"text": "❌ Закрыть", "callback_data": "del", "style": "danger"})
     return {"inline_keyboard": [row]}
 
 
@@ -1525,7 +1564,7 @@ def handle_tools(cb):
         if row:
             rows.append(row)
         rows.append([{"text": "⬅️ Назад", "callback_data": "t|b", "style": "primary"},
-                     {"text": "❌ Закрыть", "callback_data": "del"}])
+                     {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}])
         edit(cb, header(ctx) + "🛡 <b>Что ответил клиент?</b>", {"inline_keyboard": rows})
     elif act == "x" and len(parts) > 2 and parts[2] in OBJECTIONS:
         label, advice = OBJECTIONS[parts[2]]
@@ -1561,8 +1600,8 @@ CRM_HINT = ("📒 <b>База клиентов не подключена</b>\n\n
             "3. Redeploy. Кнопки появятся под карточками сами.")
 
 
-CLOSE_KB = {"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
-                                 {"text": "❌ Закрыть", "callback_data": "del"}]]}
+CLOSE_KB = {"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu", "style": "primary"},
+                                 {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]}
 
 
 def send_stats(chat_id):
@@ -1641,7 +1680,7 @@ def send_history(chat_id):
     for r in rows[:5]:
         buttons.append([{"text": f"🔎 {r['city'][:18]}",
                          "callback_data": f"h|{r['q']}"}])
-    buttons.append([{"text": "❌ Закрыть", "callback_data": "del"}])
+    buttons.append([{"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}])
     m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
            reply_markup={"inline_keyboard": buttons})
     if m:
@@ -1741,8 +1780,8 @@ def handle(update):
                    text=f"🙈 Результаты скрыты ({n} найдено). Их можно вернуть в любой момент.",
                    reply_markup={"inline_keyboard": [
                        [{"text": "📂 Показать снова", "callback_data": f"show|{parts[1]}|0"}],
-                       [{"text": "🔄 Меню", "callback_data": "menu"},
-                        {"text": "❌ Закрыть", "callback_data": "del"}]]})
+                       [{"text": "🔄 Меню", "callback_data": "menu", "style": "primary"},
+                        {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]})
             if m:
                 remember(chat_id, "hidden", m["message_id"])
         elif parts[0] == "show" and len(parts) == 3:  # «📂 Показать снова» — из кэша, без поиска

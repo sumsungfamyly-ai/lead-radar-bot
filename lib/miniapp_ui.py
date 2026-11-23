@@ -194,11 +194,14 @@ section:not([hidden]){animation:screenIn .38s ease both}
 .sheet-head{display:flex;align-items:center;justify-content:space-between;padding:16px 16px 10px}
 .sheet-head b{font-size:16px}
 .close-x{border:0;background:var(--card);color:var(--text);border-radius:50%;width:32px;height:32px;cursor:pointer}
-.tabs{display:flex;gap:7px;overflow-x:auto;padding:4px 14px 10px;scrollbar-width:none}
+.tabs{display:flex;gap:8px;overflow-x:auto;padding:4px 14px 10px;scrollbar-width:none;align-items:center}
 .tabs::-webkit-scrollbar{display:none}
-.tab{white-space:nowrap;border:1px solid var(--line);background:transparent;color:var(--hint);
-  border-radius:999px;padding:7px 11px;font-size:12px;cursor:pointer}
-.tab.on{background:var(--accent);color:#fff;border-color:transparent}
+.tab{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:4px;
+  white-space:nowrap;border:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--hint);
+  border-radius:999px;padding:8px 12px;font-size:12px;line-height:1.2;min-height:36px;cursor:pointer;box-sizing:border-box;
+  transition:transform .2s ease,box-shadow .25s ease,background .25s ease,color .25s ease,border-color .25s ease}
+.tab:hover{transform:translateY(-1px);color:var(--text)}
+.tab.on{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;box-shadow:0 8px 20px var(--glow)}
 .sheet-body{padding:4px 16px 18px;overflow-y:auto;font-size:14px}
 .sheet-body h4{margin:18px 0 6px;font-size:13px;color:var(--hint);text-transform:uppercase;letter-spacing:.5px}
 .sheet-body pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px solid var(--line);
@@ -826,7 +829,8 @@ function renderCards(){
     el.innerHTML='<span class="badge">'+badge+'</span><h3>'+esc(it.name)+'</h3>'+
       '<div class="card-toprow">'+(isNewItem(it)?'<span class="badge new-badge">✨ Новый</span>':'')+
         '<select class="statusSel" data-prev="'+esc(cur)+'">'+statusOptions(cur)+'</select></div>'+
-      (it.site?'<div class="meta">🌐 '+esc(it.site.replace(/^https?:\/\//,'').replace(/\/$/,''))+'</div>':'')+
+      (it.site?'<div class="meta">🌐 <a href="'+esc(it.site)+'" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">'+esc(it.site.replace(/^https?:\/\//,'').replace(/\/$/,''))+'</a></div>':'')+
+      ((it.site && (Array.isArray(it.issues)?it.issues:[]).some(x=>String(x).indexOf('dead')>=0||String(x).indexOf('не открывается')>=0))?'<div class="meta" style="color:var(--yellow)">⚠️ Сайт есть, но сейчас может быть недоступен</div>':'')+
       (it.addr?'<div class="meta">📍 '+esc(it.addr)+'</div>':'')+
       '<div class="meta">📞 '+(it.phone?esc(it.phone):'<span style="opacity:.6">телефона нет</span>')+'</div>'+
       (it.hours?'<div class="meta">🕒 '+esc(it.hours)+'</div>':'')+
