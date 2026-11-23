@@ -62,8 +62,8 @@ def user(text, reply_to=None):
 
 # 1. /start
 w.handle(user("/start"))
-assert any("Выбери нишу" in t for t in msgs.values()), "меню не отправлено"
-menu_mid = [m for m, t in msgs.items() if "Выбери нишу" in t][0]
+assert any("Lead Radar Mini App" in t for t in msgs.values()), "меню не отправлено"
+menu_mid = [m for m, t in msgs.items() if "Lead Radar Mini App" in t][0]
 assert 9000 not in msgs, "команда /start не удалена"
 
 # 2. выбор ниши — меню редактируется на месте
@@ -111,7 +111,7 @@ assert "Кафе Ромашка" in uploads[0][2].decode("utf-8-sig")
 # 6. кнопка Меню превращает счётчик в меню
 n_before = len(msgs)
 w.handle(cb("menu", pager2))
-assert "Выбери нишу" in msgs[pager2]
+assert "Lead Radar Mini App" in msgs[pager2]
 assert len(msgs) == n_before
 
 # 7. панель скриптов: новая заменяет старую (карточки текущей страницы)
@@ -160,7 +160,7 @@ assert any("Upstash" in t or "upstash" in t for t in msgs.values())
 # 13. город просто текстом (без reply) — поиск запускается, ниша барбершопов есть
 assert "barber" in w.NICHES, "ниша барбершопов не добавлена"
 w.handle(user("/start"))
-menu_mid = [m for m, t in msgs.items() if "Выбери нишу" in t][0]
+menu_mid = [m for m, t in msgs.items() if "Lead Radar Mini App" in t][0]
 w.handle(cb("n|barber", menu_mid))
 w.handle(cb("m|barber|n|", menu_mid))
 prompt_mid = [m for m, t in msgs.items() if t.startswith("🔎 Ниша:")][0]
@@ -193,7 +193,7 @@ assert tips_mid not in msgs, "подсказки не закрылись кно�
 w.handle(cb("n|food", pager))
 assert "Что ищем?" in msgs[pager]
 w.handle(cb("back_menu", pager))
-assert "Выбери нишу" in msgs[pager], "кнопка Назад не вернула меню"
+assert "Lead Radar Mini App" in msgs[pager], "кнопка Назад не вернула меню"
 
 # 17. мини-приложение: HTML и JSON-маршруты отвечают без ошибок
 import io

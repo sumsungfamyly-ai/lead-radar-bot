@@ -1138,23 +1138,18 @@ def find_leads(niche_key, mode, city, flags="", budget_s=45):
 # ---------- меню и карточки ----------
 def menu_markup():
     rows = []
-    if MINIAPP_URL:  # основа — мини-приложение
+    if MINIAPP_URL:
         rows.append([{"text": "🚀 Открыть мини-приложение", "web_app": {"url": MINIAPP_URL}, "style": "primary"}])
-    row = []
-    for i, (key, (label, _)) in enumerate(NICHES.items()):
-        row.append({"text": label, "callback_data": f"n|{key}", "style": "primary"})
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{"text": "🎯 Советы по продажам", "callback_data": "tips", "style": "success"}])
+    rows.append([{"text": "⚙️ Настройки", "callback_data": "settings", "style": "primary"},
+                 {"text": "ℹ️ О приложении", "callback_data": "about", "style": "success"}])
+    rows.append([{"text": "🎯 Советы по продажам", "callback_data": "tips", "style": "success"},
+                 {"text": "📊 Воронка", "callback_data": "funnel_info", "style": "primary"}])
     return {"inline_keyboard": rows}
 
 
-MENU_TEXT = ("🚀 <b>Mini App — основной режим</b>\n"
-             "Там поиск, карточки, скрипты, карта, воронка и история.\n\n"
-             "Выбери нишу бизнеса 👇 или открой мини-приложение — я найду тех, у кого <b>нет сайта</b> или он <b>слабый</b>.")
+MENU_TEXT = ("🚀 <b>Lead Radar Mini App</b>\n\n"
+             "Основная работа теперь в мини-приложении: поиск лидов, карта, скрипты, история и воронка.\n\n"
+             "В боте — быстрые настройки, подсказки и информация о приложении.")
 
 
 def potential_text(n):
@@ -1224,6 +1219,34 @@ def send_tips(chat_id):
                                               {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]})
     if m:
         remember(chat_id, "tips", m["message_id"])
+
+
+def send_about(chat_id):
+    text = ("ℹ️ <b>О Lead Radar</b>\n\n"
+            "Lead Radar помогает находить бизнесы без сайта или со слабым сайтом и готовит скрипты продаж.\n\n"
+            "• Основной режим — мини-приложение\n"
+            "• Поиск по нишам, карта, история, воронка\n"
+            "• Скрипты на 6 языках: RU, EN, FI, ET, SV, DE\n"
+            "• Экспорт CSV, статусы лидов, CRM-память")
+    if MINIAPP_URL:
+        text += "\n\n🚀 Открой мини-приложение кнопкой в меню."
+    m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+           reply_markup={"inline_keyboard": [[{"text": "🚀 Мини-приложение", "web_app": {"url": MINIAPP_URL}, "style": "primary"}] if MINIAPP_URL else [],
+                                              [{"text": "🔄 Меню", "callback_data": "menu", "style": "primary"},
+                                               {"text": "❌ Закрыть", "callback_data": "del", "style": "danger"}]]})
+    if m:
+        remember(chat_id, "about", m["message_id"])
+
+
+def send_settings(chat_id):
+    text = ("⚙️ <b>Настройки</b>\n\n"
+            f"Имя: {esc(ME)}\nКонтакт: {esc(CONTACT)}\nПортфолио: {esc(PORTFOLIO)}\n"
+            f"Цена: {esc(PRICE or '— не указана')}\nЯзык по умолчанию: {DEFAULT_LANG.upper()}\n\n"
+            "Меняются в Vercel: Settings → Environment Variables (MY_NAME, MY_CONTACT, MY_PORTFOLIO, MY_PRICE, DEFAULT_LANG), потом Redeploy.\n\n"
+            "Тема, шрифт и анимации настраиваются внутри мини-приложения (⚙️).")
+    m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=CLOSE_KB)
+    if m:
+        remember(chat_id, "settings", m["message_id"])
 
 
 def send_card(chat_id, it, city, token=None, idx=0, db=None):
@@ -1830,6 +1853,15 @@ def handle(update):
                 send_menu(chat_id)
         elif parts[0] == "tips":
             send_tips(chat_id)
+        elif parts[0] == "about":
+            send_about(chat_id)
+        elif parts[0] == "settings":
+            send_settings(chat_id)
+        elif parts[0] == "funnel_info":
+            if 'send_funnel' in globals():
+                send_funnel(chat_id)
+            else:
+                tg("sendMessage", chat_id=chat_id, text="Откройте воронку в мини-приложении: 📊", reply_markup=CLOSE_KB)
         elif parts[0] == "n" and parts[1] in NICHES:
             # выбор режима редактирует меню на месте
             _CHAT.setdefault(chat_id, {}).pop("pending", None)
