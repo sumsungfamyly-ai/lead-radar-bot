@@ -1,4 +1,4 @@
-import os, re, ssl, json, time, html, hashlib, datetime, io, csv, base64, math
+import os, re, ssl, json, time, html, hashlib, datetime, io, csv, base64, math, threading
 import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 import concurrent.futures as cf
@@ -33,7 +33,7 @@ CRM_ON = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 PAGE = 5            # карточек за раз
 WEAK_MIN = 30       # с какого балла сайт считается слабым
-MAX_ANALYZE = 40    # сколько сайтов проверять за один поиск
+MAX_ANALYZE = 60    # сколько сайтов проверять за один поиск
 
 NICHES = {
     "dentist": ("🦷 Стоматологии", ["amenity=dentist"]),
@@ -55,17 +55,23 @@ NICHES = {
     "repair": ("🔧 Ремонт техники", ["shop=electronics_repair", "craft=electronics_repair"]),
     "accountant": ("🧾 Бухгалтеры", ["office=accountant"]),
     "photo": ("📸 Фотостудии", ["shop=photo", "craft=photographer"]),
+    "barber": ("💈 Барбершопы", ["shop=hairdresser"]),
 }
 MODES = {"n": "🚫 Без сайта", "w": "🐌 Слабый сайт", "a": "🔥 Всё вместе"}
-# Слова для запасного POI-поиска (Photon) по каждой нише
+# Слова для запасного POI-поиска (Photon) по каждой нише (включая местные языки)
 NICHE_QUERY = {
-    "dentist": ["dentist"], "clinic": ["clinic"], "beauty": ["hairdresser", "beauty salon"],
-    "food": ["cafe", "restaurant"], "car": ["car repair"], "fitness": ["gym"],
-    "shop": ["clothes shop"], "hotel": ["hotel"], "lawyer": ["lawyer"],
-    "estate": ["estate agent"], "vet": ["veterinary"], "school": ["language school"],
-    "bakery": ["bakery"], "florist": ["florist"], "carwash": ["car wash"],
-    "massage": ["massage"], "repair": ["electronics repair"], "accountant": ["accountant"],
-    "photo": ["photo studio"],
+    "dentist": ["dentist", "hammaslääkäri"], "clinic": ["clinic", "lääkäriasema"],
+    "beauty": ["hairdresser", "kampaamo", "beauty salon"],
+    "food": ["cafe", "restaurant", "ravintola", "kahvila"],
+    "car": ["car repair", "autokorjaamo"], "fitness": ["gym", "kuntosali"],
+    "shop": ["clothes shop", "vaateliike"], "hotel": ["hotel", "hotelli"],
+    "lawyer": ["lawyer", "asianajotoimisto"], "estate": ["estate agent", "kiinteistönvälitys"],
+    "vet": ["veterinary", "eläinlääkäri"], "school": ["language school", "kielikoulu"],
+    "bakery": ["bakery", "leipomo"], "florist": ["florist", "kukkakauppa"],
+    "carwash": ["car wash", "autopesula"], "massage": ["massage", "hieronta"],
+    "repair": ["electronics repair", "huolto"], "accountant": ["accountant", "tilitoimisto"],
+    "photo": ["photo studio", "valokuvaamo"],
+    "barber": ["barbershop", "parturi", "barber"],
 }
 STYLES = ["primary", "success", "danger"]  # синий, зелёный, красный
 SOCIAL = ("facebook.com", "instagram.com", "vk.com", "t.me", "linktr.ee",
@@ -433,6 +439,14 @@ GENERAL_TIPS = (
 )
 
 
+from api.sales import (SCRIPTS as _SCRIPTS, PLAN_NOSITE as _PLAN_NOSITE,
+                       PLAN_WEAK as _PLAN_WEAK, GENERAL_TIPS as _GENERAL_TIPS,
+                       OBJECTIONS as _OBJECTIONS)
+T.update(_SCRIPTS)  # продающие тексты FULLY заменяют старые шаблоны выше
+PLAN_NOSITE, PLAN_WEAK = _PLAN_NOSITE, _PLAN_WEAK
+GENERAL_TIPS, OBJECTIONS = _GENERAL_TIPS, _OBJECTIONS
+
+
 # ---------- Telegram ----------
 def _strip_styles(m):
     # Telegram не поддерживает поле "style" у кнопок — убираем лишний мусор из запроса
@@ -732,10 +746,10 @@ def photon_leads(niche_key, city, lat, lon):
     words = NICHE_QUERY.get(niche_key, [niche_key])
     want = set(tuple(t.split("=")) for t in NICHES[niche_key][1])
     feats = {}
-    for word in words[:2]:
+    for word in words[:4]:
         try:
-            d = get_json(f"https://photon.komoot.io/api/?limit=50&lat={lat}&lon={lon}&q="
-                         + urllib.parse.quote(f"{word} {city}"), timeout=8)
+            d = get_json(f"https://photon.komoot.io/api/?limit=100&lat={lat}&lon={lon}&q="
+                         + urllib.parse.quote(f"{word} {city}"), timeout=5)
             for f in d.get("features", []):
                 p = f.get("properties", {})
                 if (p.get("osm_key"), p.get("osm_value")) in want and p.get("osm_id"):
@@ -751,7 +765,7 @@ def photon_leads(niche_key, city, lat, lon):
         p = f.get("properties", {})
         try:
             d = get_json(f"https://api.openstreetmap.org/api/0.6/"
-                         f"{kind_map.get(ot, 'node')}/{oid}.json", timeout=8)
+                         f"{kind_map.get(ot, 'node')}/{oid}.json", timeout=5)
             tags = d.get("elements", [{}])[0].get("tags", {})
         except Exception:
             tags = {}
@@ -760,8 +774,8 @@ def photon_leads(niche_key, city, lat, lon):
             tags["name"] = p["name"]
         return {"tags": tags, "lat": c[1], "lon": c[0]}
 
-    with cf.ThreadPoolExecutor(max_workers=10) as ex:
-        els = list(ex.map(fetch, list(feats.items())[:40]))
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        els = list(ex.map(fetch, list(feats.items())[:60]))
     return {"elements": [e for e in els if e["tags"].get("name")]}
 
 
@@ -778,7 +792,7 @@ def analyze(url):
 
     def fetch(ctx=None):
         r = urllib.request.urlopen(urllib.request.Request(url, headers=BROWSER),
-                                   timeout=6, context=ctx)
+                                   timeout=4, context=ctx)
         return r.geturl(), r.read(250000).decode("utf-8", "ignore")
 
     issues, score = [], 0
@@ -813,7 +827,7 @@ def analyze(url):
     if not re.search(r"<meta[^>]+viewport", low):
         score += 25
         issues.append(("mobile", "не адаптирован под телефон"))
-    if elapsed > 4:
+    if elapsed > 3:
         score += 10
         issues.append(("slow", f"медленно грузится ({elapsed:.0f} с)"))
     years = re.findall(r"(?:©|&copy;|copyright)[^<]{0,40}?((?:19|20)\d{2})", low)
@@ -903,44 +917,46 @@ def find_leads(niche_key, mode, city, flags=""):
     for tag in NICHES[niche_key][1]:
         k, v = tag.split("=")
         parts += f'nwr["{k}"="{v}"]["name"]{area};'
-    query = f"[out:json][timeout:10];({parts});out tags center 300;"
+    query = f"[out:json][timeout:10];({parts});out tags center 600;"
     payload = urllib.parse.urlencode({"data": query}).encode()
+
+    stop = threading.Event()
 
     def try_overpass():
         for ep in OVERPASS:
+            if stop.is_set():  # Photon уже ответил — не опрашиваем остальные серверы
+                break
             left = deadline - time.time()
-            if left < 14:  # бережём время для запасных путей и проверки сайтов
+            if left < 12:
                 break
             try:
-                return get_json(ep, data=payload, timeout=max(4, min(10, left - 12)))
+                return get_json(ep, data=payload, timeout=max(3, min(6, left - 10)))
             except Exception as err:
                 print("overpass fail", ep, err)
         return None
 
-    data, photon_tried = None, False
+    ov_data, ph_data = None, None
     with cf.ThreadPoolExecutor(max_workers=2) as ex:
         f_ov = ex.submit(try_overpass)
+        f_ph = ex.submit(photon_leads, niche_key, city, lat, lon)
+        # Раньше ждали Overpass 12 с, и только потом запускали Photon — поиск занимал 30–40 с.
+        # Теперь оба источника стартуют одновременно: Photon обычно готов за 2–5 с.
         try:
-            data = f_ov.result(timeout=12)  # Overpass тормозит — не ждём его в одиночку
-        except cf.TimeoutError:
-            photon_tried = True
-            f_ph = ex.submit(photon_leads, niche_key, city, lat, lon)
-            cf.wait([f_ov, f_ph], timeout=max(5, deadline - time.time() - 10))
-            for f in (f_ov, f_ph):  # кто успел первым — того и данные
-                if f.done():
-                    try:
-                        r = f.result()
-                        if r:
-                            data = r
-                            break
-                    except Exception as err:
-                        print("race fail", err)
-    if data is None and not photon_tried:
-        try:
-            data = photon_leads(niche_key, city, lat, lon)
-            print("used photon fallback")
+            ph_data = f_ph.result(timeout=min(14, max(6, deadline - time.time() - 12)))
         except Exception as err:
-            print("photon fallback fail", err)
+            print("photon fail", err)
+        stop.set()
+        try:
+            ov_data = f_ov.result(timeout=7)  # текущий запрос успеет завершиться
+        except Exception as err:
+            print("overpass race fail", err)
+    if ov_data and ph_data:
+        data = {"elements": ov_data.get("elements", []) + ph_data.get("elements", [])}
+        print("used overpass + photon (merged)")
+    else:
+        data = ov_data or ph_data
+        if data:
+            print("used", "overpass" if ov_data else "photon")
     if data is None:
         # последний рубеж — основной API OpenStreetMap
         try:
@@ -960,6 +976,9 @@ def find_leads(niche_key, mode, city, flags=""):
     nosite, with_site, seen = [], [], set()
     for el in elements:
         t = el.get("tags", {})
+        if niche_key == "barber":  # барбершоп ≠ салон красоты: мужской зал или barber в названии
+            if t.get("male") != "yes" and not re.search(r"barber|parturi", t.get("name", ""), re.I):
+                continue
         lat = el.get("lat") or el.get("center", {}).get("lat")
         lon = el.get("lon") or el.get("center", {}).get("lon")
         if lat is None:
@@ -994,7 +1013,7 @@ def find_leads(niche_key, mode, city, flags=""):
     weak = []
     if mode in ("w", "a") and with_site:
         cands = with_site[:MAX_ANALYZE]
-        with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        with cf.ThreadPoolExecutor(max_workers=20) as ex:
             futs = {ex.submit(analyze, it["site"]): it for it in cands}
             done, _ = cf.wait(futs, timeout=max(6, min(20, deadline - time.time())))
             for f in done:
@@ -1030,6 +1049,16 @@ MENU_TEXT = ("Выбери нишу бизнеса 👇\nЯ найду тех, �
              "а под каждой карточкой дам готовые тексты и подсказки, как взять клиента.")
 
 
+def potential_text(n):
+    """Показывает масштаб возможности, если в настройках указана цена услуги."""
+    m = re.search(r"(\d[\d\s]*)", PRICE or "")
+    if not m or not n:
+        return ""
+    cur = re.sub(r"^.*?\d[\d\s]*", "", PRICE).strip(" .–-") or "€"
+    total = int(m.group(1).replace(" ", "")) * n
+    return f"\n💰 Потенциал: {n} клиентов × {m.group(1).strip()} {cur} = <b>{total:,} {cur}</b>"
+
+
 def send_menu(chat_id):
     m = tg("sendMessage", chat_id=chat_id, reply_markup=menu_markup(), parse_mode="HTML", text=MENU_TEXT)
     if m:
@@ -1050,6 +1079,7 @@ def modes_markup(key, flags=""):
         [btns[0], btns[1]], [btns[2]],
         [tog_btn("p", "📞 Только с телефоном"), tog_btn("e", "✉️ Только с email")],
         [tog_btn("c", "🏪 Без сетей и франшиз")],
+        [{"text": "⬅️ Назад", "callback_data": "back_menu", "style": "primary"}],
     ]}
 
 
@@ -1065,7 +1095,7 @@ def prompt_text(key, mode, flags=""):
                               ("c", "без сетей")) if ch in flags]
     return (f"🔎 Ниша: {NICHES[key][0]}\n🎯 Режим: {MODES[mode]}" +
             ("\n🧰 Фильтры: " + ", ".join(fl) if fl else "") +
-            "\n\nНапиши город ответом на это сообщение.\n"
+            "\n\nПросто напиши город (или ответь на это сообщение).\n"
             "Можно с радиусом: «Helsinki, 10 км»")
 
 
@@ -1077,10 +1107,13 @@ def send_prompt(chat_id, key, mode, flags=""):
                          "input_field_placeholder": "Например: Helsinki или Turku, 10 км"})
     if m:
         remember(chat_id, "flow", m["message_id"])
+    _CHAT.setdefault(chat_id, {})["pending"] = (key, mode, flags)  # город можно писать без reply
 
 
 def send_tips(chat_id):
-    m = tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML")
+    m = tg("sendMessage", chat_id=chat_id, text=GENERAL_TIPS, parse_mode="HTML",
+           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
+                                              {"text": "❌ Закрыть", "callback_data": "del"}]]})
     if m:
         remember(chat_id, "tips", m["message_id"])
 
@@ -1132,21 +1165,34 @@ def send_card(chat_id, it, city, token=None, idx=0, db=None):
             rows.append([{"text": "❌ Отказ", "callback_data": f"c|{token}|{idx}|refused"},
                          {"text": "⭐ В избранное", "callback_data": f"c|{token}|{idx}|fav"}])
     rows.append([{"text": "✍️ Скрипты и подсказки", "callback_data": "t|o"}])
-    tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-       disable_web_page_preview=True, reply_markup={"inline_keyboard": rows})
+    return tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+              disable_web_page_preview=True, reply_markup={"inline_keyboard": rows})
+
+
+def clear_cards(chat_id):
+    """Удаляет карточки и сводку прошлого поиска — чат не засоряется."""
+    st = _CHAT.setdefault(chat_id, {})
+    for mid in st.get("cards", []):
+        delete_msg(chat_id, mid)
+    st["cards"] = []
+    st = _CHAT.setdefault(chat_id, {})
+    for kind in ("summary", "pager", "panel"):
+        if st.get(kind):
+            delete_msg(chat_id, st.pop(kind))
 
 
 def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags=""):
     city = " ".join(city.split())[:80]
     res, fresh = None, False
-    if offset > 0 and token:
-        hit = cache_load(token)  # листаем страницы — поиск уже сделан, берём из кэша
+    if token:
+        hit = cache_load(token)  # листаем/показываем снова — поиск уже сделан, берём из кэша
         if hit and hit["key"] == key and hit["mode"] == mode:
             res, city, flags = hit["res"], hit["city"], hit.get("flags", "")
     if res is None:
         fresh = True
+        clear_cards(chat_id)  # новый поиск — убираем карточки прошлого
         status = tg("sendMessage", chat_id=chat_id,
-                    text="⏳ Ищу и проверяю сайты, это может занять до 30 секунд...")
+                    text="⏳ Ищу клиентов и проверяю сайты — обычно 5–15 секунд...")
         try:
             res = find_leads(key, mode, city, flags)
         except Exception as e:
@@ -1159,7 +1205,9 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
     if res == "error":
         tg("sendMessage", chat_id=chat_id,
            text="⚠️ Все серверы карт сейчас перегружены — я пробовал 4 запасных и основной API OSM. "
-                "Это временно: подожди 1–2 минуты и повтори поиск.")
+                "Это временно: подожди 1–2 минуты и повтори поиск.",
+           reply_markup={"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
+                                              {"text": "❌ Закрыть", "callback_data": "del"}]]})
         return
     if res is None:
         tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷 Проверь название или напиши по-английски.")
@@ -1171,20 +1219,31 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
                  if db.get(lead_id(it), {}).get("status") not in ("contacted", "deal", "refused")]
     if fresh:
         token = cache_store(key, mode, city, res, flags)
-        tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
-           text=(f"📊 <b>{esc(city)}</b>, {NICHES[key][0]}\n"
-                 f"🚫 без сайта: <b>{n_no}</b>\n"
-                 f"🐌 слабых сайтов: <b>{n_weak}</b> (проверено до {MAX_ANALYZE} из {n_with})"))
+        sm = tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                text=(f"📊 <b>{esc(city)}</b>, {NICHES[key][0]}\n"
+                      f"🚫 без сайта: <b>{n_no}</b>\n"
+                      f"🐌 слабых сайтов: <b>{n_weak}</b> (проверено до {MAX_ANALYZE} из {n_with})"
+                      + potential_text(n_no)))
+        if sm:
+            remember(chat_id, "summary", sm["message_id"])
     if not items:
         tg("sendMessage", chat_id=chat_id,
            text="Подходящих не нашёл (или все уже в твоей базе ✅). Попробуй другую нишу, режим или фильтры.")
         return send_menu(chat_id)
+    st = _CHAT.setdefault(chat_id, {})
+    if not fresh:  # листаем дальше — карточки прошлой страницы убираем
+        for mid in st.get("cards", []):
+            delete_msg(chat_id, mid)
+        st["cards"] = []
     for i, it in enumerate(items[offset:offset + PAGE], start=offset):
-        send_card(chat_id, it, city, token=token, idx=i, db=db)
+        m = send_card(chat_id, it, city, token=token, idx=i, db=db)
+        if m:
+            st.setdefault("cards", []).append(m["message_id"])
     end = min(offset + PAGE, len(items))
     buttons = []
     if end < len(items):
         buttons.append({"text": "➡️ Ещё", "callback_data": f"p|{key}|{mode}|{token}|{end}|{flags}"})
+    buttons.append({"text": "🙈 Скрыть", "callback_data": f"hide|{token}"})
     buttons.append({"text": "📥 CSV", "callback_data": f"e|{token}"})
     buttons.append({"text": "🔄 Меню", "callback_data": "menu"})
     pager = tg("sendMessage", chat_id=chat_id, text=f"Показано {offset + 1}–{end} из {len(items)}",
@@ -1317,8 +1376,10 @@ def panel_markup(ctx):
          {"text": "🔁 Follow-up", "callback_data": "t|c|fu"}],
         [{"text": "🛡 Возражения", "callback_data": "t|x"},
          {"text": "📋 План сделки", "callback_data": "t|p"}],
+        [{"text": "🤝 Закрыть сделку", "callback_data": "t|z"}],
         lang_btns[:3],
         lang_btns[3:],
+        [{"text": "❌ Закрыть", "callback_data": "del"}],
     ]}
 
 
@@ -1332,6 +1393,7 @@ def back_markup(extra=None):
     if extra:
         row.append(extra)
     row.append({"text": "⬅️ Назад", "callback_data": "t|b", "style": "primary"})
+    row.append({"text": "❌ Закрыть", "callback_data": "del"})
     return {"inline_keyboard": [row]}
 
 
@@ -1377,7 +1439,8 @@ def handle_tools(cb):
                 row = []
         if row:
             rows.append(row)
-        rows.append([{"text": "⬅️ Назад", "callback_data": "t|b", "style": "primary"}])
+        rows.append([{"text": "⬅️ Назад", "callback_data": "t|b", "style": "primary"},
+                     {"text": "❌ Закрыть", "callback_data": "del"}])
         edit(cb, header(ctx) + "🛡 <b>Что ответил клиент?</b>", {"inline_keyboard": rows})
     elif act == "x" and len(parts) > 2 and parts[2] in OBJECTIONS:
         label, advice = OBJECTIONS[parts[2]]
@@ -1388,6 +1451,8 @@ def handle_tools(cb):
     elif act == "p":
         plan = PLAN_NOSITE if ctx["kind"] == "nosite" else PLAN_WEAK
         edit(cb, header(ctx) + plan, back_markup())
+    elif act == "z":  # продающий блок: как довести клиента до оплаты
+        edit(cb, header(ctx) + T[ctx["lang"]]["close_deal"].format(**vars_for(ctx)), back_markup())
 
 
 HELP_TEXT = ("👋 <b>Бот для поиска клиентов</b>\n\n"
@@ -1396,7 +1461,7 @@ HELP_TEXT = ("👋 <b>Бот для поиска клиентов</b>\n\n"
              "возражения и вести клиента до сделки.\n\n"
              "/start — меню\n/tips — советы по продажам\n/me — твои данные для текстов\n"
              "/stats — база клиентов и напоминания\n/fav — избранное\n\n"
-             "Под карточкой: 🖼 скриншот сайта, 🚀 скорость от Google, 📥 CSV-выгрузка.\n\nПоехали 👇")
+             "Под карточкой: 🖼 скриншот сайта, 🚀 скорость от Google, 📥 CSV-выгрузка.\n🙈 Скрыть / 📂 Показать снова — управлять результатами.\nВ скриптах: 🤝 Закрыть сделку — как довести клиента до оплаты.\n\nПоехали 👇")
 
 CRM_HINT = ("📒 <b>База клиентов не подключена</b>\n\n"
             "Чтобы отмечать «✅ Написал / 🤝 Сделка / ❌ Отказ», вести избранное и получать "
@@ -1408,9 +1473,13 @@ CRM_HINT = ("📒 <b>База клиентов не подключена</b>\n\n
             "3. Redeploy. Кнопки появятся под карточками сами.")
 
 
+CLOSE_KB = {"inline_keyboard": [[{"text": "🔄 Меню", "callback_data": "menu"},
+                                 {"text": "❌ Закрыть", "callback_data": "del"}]]}
+
+
 def send_stats(chat_id):
     if not CRM_ON:
-        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML", reply_markup=CLOSE_KB)
     else:
         db = crm_all()
         now = int(time.time())
@@ -1432,14 +1501,14 @@ def send_stats(chat_id):
             text += "🔁 <b>Пора напомнить о себе:</b>\n" + "\n".join("• " + esc(n) for n in due[:15])
         else:
             text += "🔁 Напоминаний на ближайшие сутки нет."
-        m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=CLOSE_KB)
     if m:
         remember(chat_id, "stats", m["message_id"])
 
 
 def send_fav(chat_id):
     if not CRM_ON:
-        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=CRM_HINT, parse_mode="HTML", reply_markup=CLOSE_KB)
     else:
         favs = [r for r in crm_all().values() if r.get("fav")]
         if not favs:
@@ -1457,7 +1526,7 @@ def send_fav(chat_id):
                     line += f" ({mark})"
                 text += line + "\n"
         m = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-               disable_web_page_preview=True)
+               disable_web_page_preview=True, reply_markup=CLOSE_KB)
     if m:
         remember(chat_id, "fav", m["message_id"])
 
@@ -1485,11 +1554,58 @@ def handle(update):
         mid = cb["message"]["message_id"]
         if data.startswith("t|"):
             handle_tools(cb)
+        elif parts[0] == "del":  # «❌ Закрыть» — убираем сообщение и память о нём
+            delete_msg(chat_id, mid)
+            st = _CHAT.setdefault(chat_id, {})
+            for k, v in list(st.items()):
+                if v == mid:
+                    st.pop(k)
+        elif parts[0] == "back_menu":  # «⬅️ Назад» с экрана режимов — в меню, на месте
+            _CHAT.setdefault(chat_id, {}).pop("pending", None)
+            if not edit_msg(chat_id, mid, MENU_TEXT, menu_markup()):
+                send_menu(chat_id)
+            else:
+                remember(chat_id, "menu", mid)
+        elif parts[0] == "hide" and len(parts) == 2:  # «🙈 Скрыть» — убираем карточки
+            hit = cache_load(parts[1])
+            clear_cards(chat_id)
+            n = len(hit["res"][0]) if hit else 0
+            m = tg("sendMessage", chat_id=chat_id,
+                   text=f"🙈 Результаты скрыты ({n} найдено). Их можно вернуть в любой момент.",
+                   reply_markup={"inline_keyboard": [
+                       [{"text": "📂 Показать снова", "callback_data": f"show|{parts[1]}|0"}],
+                       [{"text": "🔄 Меню", "callback_data": "menu"},
+                        {"text": "❌ Закрыть", "callback_data": "del"}]]})
+            if m:
+                remember(chat_id, "hidden", m["message_id"])
+        elif parts[0] == "show" and len(parts) == 3:  # «📂 Показать снова» — из кэша, без поиска
+            hit = cache_load(parts[1])
+            if not hit:
+                tg("sendMessage", chat_id=chat_id, text="Поиск устарел — запусти новый через меню.")
+                return
+            st = _CHAT.setdefault(chat_id, {})
+            if st.get("hidden"):
+                delete_msg(chat_id, st.pop("hidden"))
+            try:
+                offset = int(parts[2])
+            except ValueError:
+                offset = 0
+            items, n_no, n_weak, n_with = hit["res"]
+            sm = tg("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                    text=(f"📊 <b>{esc(hit['city'])}</b>, {NICHES[hit['key']][0]}\n"
+                          f"🚫 без сайта: <b>{n_no}</b>\n🐌 слабых сайтов: <b>{n_weak}</b>"
+                          + potential_text(n_no)))
+            if sm:
+                remember(chat_id, "summary", sm["message_id"])
+            run_search(chat_id, hit["key"], hit["mode"], hit["city"], offset, token=parts[1])
         elif parts[0] == "menu":
             # превращаем сообщение со счётчиком страниц в меню — без нового сообщения
             st = _CHAT.setdefault(chat_id, {})
+            st.pop("pending", None)
             if st.get("pager") == mid:
                 st.pop("pager")
+            if st.get("hidden") == mid:
+                st.pop("hidden")
             if edit_msg(chat_id, mid, MENU_TEXT, menu_markup()):
                 remember(chat_id, "menu", mid)
             else:
@@ -1498,6 +1614,7 @@ def handle(update):
             send_tips(chat_id)
         elif parts[0] == "n" and parts[1] in NICHES:
             # выбор режима редактирует меню на месте
+            _CHAT.setdefault(chat_id, {}).pop("pending", None)
             if not edit_msg(chat_id, mid, modes_text(parts[1]), modes_markup(parts[1])):
                 tg("sendMessage", chat_id=chat_id, text=modes_text(parts[1]),
                    reply_markup=modes_markup(parts[1]))
@@ -1584,23 +1701,25 @@ def handle(update):
                      f"Имя: {esc(ME)}\nКонтакт: {esc(CONTACT)}\nПортфолио: {esc(PORTFOLIO)}\n"
                      f"Цена: {esc(PRICE or '— не указана')}\nЯзык по умолчанию: {DEFAULT_LANG.upper()}\n\n"
                      "Меняются в Vercel: Settings → Environment Variables (MY_NAME, MY_CONTACT, "
-                     "MY_PORTFOLIO, MY_PRICE, DEFAULT_LANG), потом Redeploy."))
+                     "MY_PORTFOLIO, MY_PRICE, DEFAULT_LANG), потом Redeploy."),
+               reply_markup=CLOSE_KB)
         if m:
             remember(chat_id, "me", m["message_id"])
         return
     if text.startswith("/help"):
-        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML", reply_markup=CLOSE_KB)
         if m:
             remember(chat_id, "help", m["message_id"])
         return
     if text.startswith("/start"):
-        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML")
+        m = tg("sendMessage", chat_id=chat_id, text=HELP_TEXT, parse_mode="HTML", reply_markup=CLOSE_KB)
         if m:
             remember(chat_id, "help", m["message_id"])
         return send_menu(chat_id)
 
     reply = msg.get("reply_to_message") or {}
     reply_text = reply.get("text", "")
+    st = _CHAT.setdefault(chat_id, {})
     if reply_text.startswith("🔎 Ниша:") and not text.startswith("/"):
         key = next((k for k, (lbl, _) in NICHES.items() if lbl in reply_text), None)
         mode = next((m for m, lbl in MODES.items() if lbl in reply_text), None)
@@ -1608,8 +1727,14 @@ def handle(update):
                                            ("c", "без сетей")) if lbl in reply_text)
         if key and mode:
             # после поиска удаляем сообщение с городом и подсказку "напиши город"
+            st.pop("pending", None)
             return run_search(chat_id, key, mode, text, 0, flags=flags,
                               cleanup=(msg["message_id"], reply.get("message_id")))
+    elif st.get("pending") and not text.startswith("/"):
+        # город написали просто текстом, без reply — тоже работает
+        key, mode, flags = st.pop("pending")
+        return run_search(chat_id, key, mode, text, 0, flags=flags,
+                          cleanup=(msg["message_id"], st.get("flow")))
     send_menu(chat_id)
 
 

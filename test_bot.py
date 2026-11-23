@@ -114,10 +114,11 @@ w.handle(cb("menu", pager2))
 assert "Выбери нишу" in msgs[pager2]
 assert len(msgs) == n_before
 
-# 7. панель скриптов: новая заменяет старую
-w.handle(cb("t|o", cards[0]))
+# 7. панель скриптов: новая заменяет старую (карточки текущей страницы)
+cards_now = [m for m, t in msgs.items() if "Кафе Ромашка" in t]
+w.handle(cb("t|o", cards_now[0]))
 panel1 = [m for m, t in msgs.items() if t.startswith("✍️")][0]
-w.handle(cb("t|o", cards[1]))
+w.handle(cb("t|o", cards_now[1]))
 assert panel1 not in msgs, "старая панель скриптов не удалена"
 panel2 = [m for m, t in msgs.items() if t.startswith("✍️")][0]
 
@@ -126,10 +127,13 @@ n_before = len(msgs)
 w.handle(cb("t|L|de", panel2))
 w.handle(cb("t|c|dm", panel2))
 assert len(msgs) == n_before
-assert "Hallo!" in msgs[panel2], "немецкий текст не подставился"
+assert "gute Lage" in msgs[panel2], "немецкий текст не подставился"
 w.handle(cb("t|L|et", panel2))
 w.handle(cb("t|c|em", panel2))
 assert "Tere!" in msgs[panel2], "эстонский текст не подставился"
+w.handle(cb("t|L|ru", panel2))
+w.handle(cb("t|z", panel2))
+assert "Как довести до оплаты" in msgs[panel2], "блок закрытия сделки не открылся"
 w.handle(cb("t|b", panel2))
 assert "Выбери, что нужно" in msgs[panel2]
 
@@ -153,5 +157,43 @@ w.handle(user("/stats"))
 w.handle(user("/fav"))
 assert any("Upstash" in t or "upstash" in t for t in msgs.values())
 
-print("OK: все 12 сценариев прошли")
+# 13. город просто текстом (без reply) — поиск запускается, ниша барбершопов есть
+assert "barber" in w.NICHES, "ниша барбершопов не добавлена"
+w.handle(user("/start"))
+menu_mid = [m for m, t in msgs.items() if "Выбери нишу" in t][0]
+w.handle(cb("n|barber", menu_mid))
+w.handle(cb("m|barber|n|", menu_mid))
+prompt_mid = [m for m, t in msgs.items() if t.startswith("🔎 Ниша:")][0]
+n_search = searches[0]
+w.handle(user("Helsinki"))
+assert searches[0] == n_search + 1, "город без reply не запустил поиск"
+assert prompt_mid not in msgs, "подсказка не удалена после поиска без reply"
+
+# 14. 🙈 Скрыть / 📂 Показать снова — без повторного поиска
+token = list(w._CACHE)[0]
+pager = [m for m, t in msgs.items() if t.startswith("Показано")][0]
+w.handle(cb(f"hide|{token}", pager))
+assert not any("Кафе Ромашка" in t for t in msgs.values()), "карточки не скрылись"
+hidden = [m for m, t in msgs.items() if t.startswith("🙈")][0]
+n_search = searches[0]
+w.handle(cb(f"show|{token}|0", hidden))
+assert searches[0] == n_search, "«Показать снова» запустил поиск заново"
+assert len([m for m, t in msgs.items() if "Кафе Ромашка" in t]) == 5, "карточки не вернулись"
+assert hidden not in msgs, "сообщение «скрыто» не удалено"
+
+# 15. ❌ Закрыть убирает подсказки
+pager = [m for m, t in msgs.items() if t.startswith("Показано")][0]
+w.handle(cb("menu", pager))
+w.handle(cb("tips", pager))
+tips_mid = w._CHAT[1]["tips"]
+w.handle(cb("del", tips_mid))
+assert tips_mid not in msgs, "подсказки не закрылись кнопкой"
+
+# 16. ⬅️ Назад с экрана режимов возвращает в меню на месте
+w.handle(cb("n|food", pager))
+assert "Что ищем?" in msgs[pager]
+w.handle(cb("back_menu", pager))
+assert "Выбери нишу" in msgs[pager], "кнопка Назад не вернула меню"
+
+print("OK: все 16 сценариев прошли")
 print("живых сообщений в чате:", len(msgs))
