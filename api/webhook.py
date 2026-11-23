@@ -16,7 +16,9 @@ BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 OVERPASS = ["https://overpass-api.de/api/interpreter",
             "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter",
-            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+            "https://overpass.osm.jp/api/interpreter",
+            "https://z.overpass-api.de/api/interpreter"]
 
 # ---------- ТВОИ ДАННЫЕ (задаются в Vercel -> Environment Variables) ----------
 ME = os.environ.get("MY_NAME") or "[ваше имя]"

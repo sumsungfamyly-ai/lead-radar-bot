@@ -291,6 +291,11 @@ section:not([hidden]){animation:screenIn .38s ease both}
 .statusSel{margin-left:auto;max-width:142px;border:1px solid var(--line);background:var(--soft);
   color:var(--text);border-radius:9px;padding:5px 8px;font-size:11px;cursor:pointer;outline:none}
 .statusSel:focus{border-color:var(--accent)}
+.quick-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.qbtn{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:7px 10px;font-size:12px;cursor:pointer;transition:.2s ease}
+.qbtn:hover{transform:translateY(-1px)}
+.qbtn.on{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;box-shadow:0 6px 16px var(--glow)}
+.qbtn.danger.on{background:linear-gradient(135deg,#ff7a7a,#d94f4f)}
 .card.flash{outline:2px solid var(--accent);outline-offset:3px;box-shadow:0 0 0 7px var(--glow)}
 .meta a{color:var(--accent);text-decoration:none;margin-right:9px;border-bottom:1px dotted var(--accent)}
 .audit-line{color:var(--hint)}
@@ -344,9 +349,7 @@ section:not([hidden]){animation:screenIn .38s ease both}
       <span class="lang-cloud">🇷🇺 RU</span><span class="lang-cloud">🇬🇧 EN</span><span class="lang-cloud">🇫🇮 FI</span>
       <span class="lang-cloud">🇪🇪 ET</span><span class="lang-cloud">🇸🇪 SV</span><span class="lang-cloud">🇩🇪 DE</span>
     </div>
-    <div class="hero-stats">
-      <span>🗺 <b>карты</b> + кэш</span><span>⚡ быстрый поиск</span><span>✨ Mini App</span>
-    </div>
+
   </div>
 
   <section id="setup">
@@ -377,16 +380,15 @@ section:not([hidden]){animation:screenIn .38s ease both}
   <section id="results" hidden>
     <div class="summary" id="summary"></div>
     <div class="toolbar">
-      <button class="mini" id="toggleView">🙈 Скрыть</button>
       <button class="mini" id="mapBtn">🗺 Карта</button>
       <button class="mini" id="historyBtn">🕘 История</button>
-      <button class="mini" id="csv">📥 CSV</button>
+      <button class="mini" id="csv">📥 Скачать CSV</button>
       <button class="mini" id="again">🔄 Новый поиск</button>
     </div>
     <div class="filter-row" id="filters"></div>
     <div id="map" hidden></div>
     <div id="cards"></div>
-    <div class="hidden-note" id="hiddenNote" hidden><b>Результаты скрыты</b>Они никуда не делись — нажми, чтобы вернуть.</div>
+
     <button id="more" hidden>Показать ещё ↓</button>
   </section>
 </div>
@@ -540,9 +542,8 @@ function applyView(){
   const f=$('#filters');if(f)f.hidden=!!state.hidden;
   $('#map').hidden=state.hidden||!mapOn;
   $('#cards').hidden=state.hidden||mapOn;
-  $('#hiddenNote').hidden=!state.hidden;
+  const hn=$('#hiddenNote'); if(hn) hn.hidden=!state.hidden;
   $('#more').hidden=state.hidden||mapOn||state.page*5>=total;
-  $('#toggleView').textContent=state.hidden?'📂 Показать':'🙈 Скрыть';
   const mb=$('#mapBtn');if(mb)mb.textContent=mapOn?'📋 Список':'🗺 Карта';
   if(mapOn&&!state.hidden)renderMap();
 }
@@ -607,23 +608,23 @@ function relDate(ts){
   try{return new Date(t).toLocaleDateString('ru-RU')}catch(e){return ''}
 }
 async function changeStatus(id,name,site,value,sel,after){
-  if(!sel)return;
-  const old=sel.dataset.prev||sel.value;
-  sel.disabled=true;
+  const it=(state.data&&state.data.items||[]).find(x=>itemKey(x)===id);
+  const old=sel?(sel.dataset.prev||sel.value):(it&&it.status||'new');
+  if(sel)sel.disabled=true;
   try{
     const r=await api('status',{id:id,name:name||'',site:site||'',status:value});
     if(!r||!r.ok)throw new Error('bad');
     const final=r.status||value;
-    const it=(state.data&&state.data.items||[]).find(x=>itemKey(x)===id);
     if(it)it.status=final;
     if(r.counts&&Object.keys(r.counts).length)state.counts=r.counts;
-    sel.dataset.prev=final;sel.value=final;
+    if(sel){sel.dataset.prev=final;sel.value=final}
+    document.querySelectorAll('[data-qid="'+CSS.escape(String(id))+'"]').forEach(b=>b.classList.toggle('on',b.dataset.qs===final));
     haptic('success');toast('Статус: '+statusLabel(final));
     if(after)after();
   }catch(e){
-    sel.value=old;
+    if(sel)sel.value=old;
     warnOnce('status','Не удалось обновить статус');
-  }finally{sel.disabled=false}
+  }finally{if(sel)sel.disabled=false}
 }
 async function openHistory(){
   $('#historySheet').hidden=false;haptic('medium');
@@ -730,7 +731,6 @@ async function init(){
   $('#find').onclick=startSearch;
   $('#city').onkeydown=e=>{if(e.key==='Enter')startSearch()};
   $('#again').onclick=()=>{state.hidden=false;show('setup')};
-  $('#toggleView').onclick=()=>{haptic();state.hidden=!state.hidden;applyView()};
   $('#mapBtn').onclick=()=>{haptic();state.view=state.view==='map'?'list':'map';state.hidden=false;applyView()};
   $('#historyBtn').onclick=openHistory;
   $('#funnelBtn').onclick=openFunnel;
@@ -819,7 +819,8 @@ async function startSearch(){
     const r=await api('search',{key:keys[0],keys:keys,mode:state.mode,city:city,flags:state.flags});
     if(!r.ok)throw new Error(r.error||'Ошибка поиска');
     state.data=r;renderResults();show('results');
-    if(r.partial||r.stale)toast(r.stale?'Показаны последние сохранённые результаты':'Часть источников не ответила, показано что нашли');
+    if(r.message)toast(r.message);
+    else if(r.partial||r.stale)toast(r.stale?'Показаны последние сохранённые результаты':'Часть источников не ответила, показано что нашли');
     haptic('success');
   }catch(e){toast(e.message||'Сервер карт перегружен — попробуйте ещё раз');show('setup')}
   finally{if(anim){anim();anim=null}$('#find').disabled=false}
@@ -846,7 +847,8 @@ function renderCards(){
   const items=visibleItems(),from=state.page*5,part=items.slice(from,from+5);
   state.visible=items;
   if(!items.length){
-    $('#cards').innerHTML='<div class="list-empty"><b>Ничего не найдено</b>Попробуйте изменить фильтры.</div>';
+    const msg=(state.data&&state.data.message)||'Попробуйте изменить фильтры или нишу.';
+    $('#cards').innerHTML='<div class="list-empty"><b>Ничего не найдено</b>'+esc(msg)+'</div>';
     $('#more').hidden=true;return;
   }
   $('#cards').innerHTML='';
@@ -872,6 +874,11 @@ function renderCards(){
       auditLine(it.audit)+
       (issues?'<div class="issues">⚠ '+issues+'</div>':'')+
       (pitch?'<div class="pitch">💡 Предложи: '+esc(pitch)+'</div>':'')+
+      '<div class="quick-row">'+
+        [['contacted','✉️ Написал'],['replied','💬 Ответил'],['deal','🤝 Сделка'],['lost','❌ Отказ']].map(([s,l])=>
+          '<button class="qbtn'+(cur===s?' on':'')+(s==='lost'?' danger':'')+'" data-qid="'+esc(itemKey(it))+'" data-qs="'+s+'" data-qi="'+i+'">'+l+'</button>'
+        ).join('')+
+      '</div>'+
       '<div class="card-actions">'+
       '<button class="mini main" data-act="scripts" data-i="'+i+'">✍️ Скрипты</button>'+
       '<a class="mini" href="https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(it.lat+','+it.lon)+'" target="_blank">📍 Карта</a>'+
@@ -880,6 +887,7 @@ function renderCards(){
     el.querySelector('[data-act=scripts]').onclick=()=>openScripts(i);
     const sel=el.querySelector('.statusSel');
     sel.onchange=()=>changeStatus(itemKey(it),it.name,it.site||'',sel.value,sel);
+    el.querySelectorAll('.qbtn').forEach(b=>b.onclick=()=>changeStatus(itemKey(it),it.name,it.site||'',b.dataset.qs,sel));
     $('#cards').appendChild(el);
   });
   $('#more').hidden=from+5>=items.length||state.hidden;

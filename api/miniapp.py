@@ -222,6 +222,21 @@ def search(data):
     if not merged and errors:
         return {"ok": False, "error": "Карты временно недоступны. Попробуйте ещё раз через 20-30 секунд."}
 
+    exclude_seen = bool(data.get("exclude_seen", True))
+    prev_seen = set()
+    if exclude_seen:
+        try:
+            prev_seen = set(ledger.seen().keys())
+        except Exception:
+            prev_seen = set()
+    if prev_seen:
+        merged = [it for it in merged if it.get("id") not in prev_seen]
+
+    # пересчитываем счётчики после фильтра
+    n_no = sum(1 for it in merged if it.get("kind") == "nosite")
+    n_weak = sum(1 for it in merged if it.get("kind") == "weak")
+    n_with = 0
+
     label = _label_for(keys)
     q = ledger.query_id("+".join(sorted(keys)), mode, city, flags)
     try:
@@ -241,6 +256,10 @@ def search(data):
     else:
         count = n_no + n_weak
 
+    msg = ""
+    if not merged and not errors:
+        msg = "Новых клиентов не найдено — эти результаты уже показывались раньше."
+
     return {
         "ok": True,
         "query_id": q,
@@ -253,6 +272,7 @@ def search(data):
         "total": len(merged),
         "stale": used_stale,
         "partial": errors > 0,
+        "message": msg,
         "potential": _plain(w.potential_text(count)),
         "items": [_lead(it, city, new_ids, crm) for it in merged],
     }
