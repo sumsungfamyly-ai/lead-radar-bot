@@ -57,6 +57,16 @@ NICHES = {
     "photo": ("📸 Фотостудии", ["shop=photo", "craft=photographer"]),
 }
 MODES = {"n": "🚫 Без сайта", "w": "🐌 Слабый сайт", "a": "🔥 Всё вместе"}
+# Слова для запасного POI-поиска (Photon) по каждой нише
+NICHE_QUERY = {
+    "dentist": ["dentist"], "clinic": ["clinic"], "beauty": ["hairdresser", "beauty salon"],
+    "food": ["cafe", "restaurant"], "car": ["car repair"], "fitness": ["gym"],
+    "shop": ["clothes shop"], "hotel": ["hotel"], "lawyer": ["lawyer"],
+    "estate": ["estate agent"], "vet": ["veterinary"], "school": ["language school"],
+    "bakery": ["bakery"], "florist": ["florist"], "carwash": ["car wash"],
+    "massage": ["massage"], "repair": ["electronics repair"], "accountant": ["accountant"],
+    "photo": ["photo studio"],
+}
 STYLES = ["primary", "success", "danger"]  # синий, зелёный, красный
 SOCIAL = ("facebook.com", "instagram.com", "vk.com", "t.me", "linktr.ee",
           "ok.ru", "wa.me", "tiktok.com", "fb.com")
@@ -484,8 +494,11 @@ def cache_store(key, mode, city, res, flags=""):
     now = time.time()
     for t in [t for t, v in _CACHE.items() if now - v["ts"] > CACHE_TTL]:
         _CACHE.pop(t, None)
-    _CACHE[token] = {"key": key, "mode": mode, "city": city, "res": res,
-                     "flags": flags, "ts": now}
+    entry = {"key": key, "mode": mode, "city": city, "res": res,
+             "flags": flags, "ts": now}
+    _CACHE[token] = entry
+    if CRM_ON:  # постоянный кэш на 7 дней: повторный поиск не трогает карты вообще
+        kv_cmd("SET", "cache:" + token, json.dumps(entry, ensure_ascii=False), "EX", 7 * 86400)
     return token
 
 
@@ -493,6 +506,15 @@ def cache_load(token):
     v = _CACHE.get(token)
     if v and time.time() - v["ts"] <= CACHE_TTL:
         return v
+    if CRM_ON:
+        raw = kv_cmd("GET", "cache:" + token)
+        if raw:
+            try:
+                v = json.loads(raw)
+                _CACHE[token] = v
+                return v
+            except Exception:
+                pass
     return None
 
 
@@ -704,6 +726,45 @@ def osm_api_data(bbox, niche_tags):
     return {"elements": elements}
 
 
+def photon_leads(niche_key, city, lat, lon):
+    """Ещё один независимый источник: Photon (инфраструктура Komoot).
+    Находит объекты по названию, полные теги (сайт/телефон) добираем из API OSM."""
+    words = NICHE_QUERY.get(niche_key, [niche_key])
+    want = set(tuple(t.split("=")) for t in NICHES[niche_key][1])
+    feats = {}
+    for word in words[:2]:
+        try:
+            d = get_json(f"https://photon.komoot.io/api/?limit=50&lat={lat}&lon={lon}&q="
+                         + urllib.parse.quote(f"{word} {city}"), timeout=8)
+            for f in d.get("features", []):
+                p = f.get("properties", {})
+                if (p.get("osm_key"), p.get("osm_value")) in want and p.get("osm_id"):
+                    feats[(p.get("osm_type"), p["osm_id"])] = f
+        except Exception as err:
+            print("photon poi fail", err)
+    if not feats:
+        raise RuntimeError("photon empty")
+    kind_map = {"N": "node", "W": "way", "R": "relation"}
+
+    def fetch(item):
+        (ot, oid), f = item
+        p = f.get("properties", {})
+        try:
+            d = get_json(f"https://api.openstreetmap.org/api/0.6/"
+                         f"{kind_map.get(ot, 'node')}/{oid}.json", timeout=8)
+            tags = d.get("elements", [{}])[0].get("tags", {})
+        except Exception:
+            tags = {}
+        c = f.get("geometry", {}).get("coordinates") or [lon, lat]
+        if not tags.get("name") and p.get("name"):
+            tags["name"] = p["name"]
+        return {"tags": tags, "lat": c[1], "lon": c[0]}
+
+    with cf.ThreadPoolExecutor(max_workers=10) as ex:
+        els = list(ex.map(fetch, list(feats.items())[:40]))
+    return {"elements": [e for e in els if e["tags"].get("name")]}
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -843,22 +904,48 @@ def find_leads(niche_key, mode, city, flags=""):
         k, v = tag.split("=")
         parts += f'nwr["{k}"="{v}"]["name"]{area};'
     query = f"[out:json][timeout:10];({parts});out tags center 300;"
-    data = None
-    for ep in OVERPASS:
-        left = deadline - time.time()
-        if left < 14:  # бережём время для запасного пути и проверки сайтов
-            break
+    payload = urllib.parse.urlencode({"data": query}).encode()
+
+    def try_overpass():
+        for ep in OVERPASS:
+            left = deadline - time.time()
+            if left < 14:  # бережём время для запасных путей и проверки сайтов
+                break
+            try:
+                return get_json(ep, data=payload, timeout=max(4, min(10, left - 12)))
+            except Exception as err:
+                print("overpass fail", ep, err)
+        return None
+
+    data, photon_tried = None, False
+    with cf.ThreadPoolExecutor(max_workers=2) as ex:
+        f_ov = ex.submit(try_overpass)
         try:
-            data = get_json(ep, data=urllib.parse.urlencode({"data": query}).encode(),
-                            timeout=max(4, min(12, left - 10)))
-            break
+            data = f_ov.result(timeout=12)  # Overpass тормозит — не ждём его в одиночку
+        except cf.TimeoutError:
+            photon_tried = True
+            f_ph = ex.submit(photon_leads, niche_key, city, lat, lon)
+            cf.wait([f_ov, f_ph], timeout=max(5, deadline - time.time() - 10))
+            for f in (f_ov, f_ph):  # кто успел первым — того и данные
+                if f.done():
+                    try:
+                        r = f.result()
+                        if r:
+                            data = r
+                            break
+                    except Exception as err:
+                        print("race fail", err)
+    if data is None and not photon_tried:
+        try:
+            data = photon_leads(niche_key, city, lat, lon)
+            print("used photon fallback")
         except Exception as err:
-            print("overpass fail", ep, err)
+            print("photon fallback fail", err)
     if data is None:
-        # все Overpass легли/перегружены — идём в основной API OpenStreetMap
+        # последний рубеж — основной API OpenStreetMap
         try:
             data = osm_api_data((s, w, n, e), NICHES[niche_key][1])
-            print("overpass down, used osm api fallback")
+            print("used osm api fallback")
         except Exception as err:
             print("osm api fail", err)
             raise RuntimeError("maps down")
