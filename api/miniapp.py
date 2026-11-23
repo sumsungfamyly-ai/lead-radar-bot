@@ -171,7 +171,7 @@ def search(data):
         return {"ok": False, "error": "Напишите город"}
     flags = "".join(ch for ch in str(data.get("flags") or "") if ch in "pec")
 
-    merged, seen = [], set()
+    merged, seen, seen_norm = [], set(), set()
     n_no = n_weak = n_with = 0
     errors = 0
     used_stale = False
@@ -214,9 +214,15 @@ def search(data):
             it["id"] = ledger.lead_id(it.get("name"), it.get("addr"),
                                       it.get("site"), city,
                                       it.get("lat"), it.get("lon"))
-            if len(keys) > 1 and it["id"] in seen:
+            nm = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-яёіїєäöüßåøæ\s]", " ", str(it.get("name") or "").lower())).strip()
+            try:
+                nk = f"{nm}|{round(float(it.get('lat')),3)}|{round(float(it.get('lon')),3)}" if it.get("lat") is not None and it.get("lon") is not None else f"{nm}|{str(it.get('addr') or '').lower().strip()}"
+            except Exception:
+                nk = f"{nm}|{str(it.get('addr') or '').lower().strip()}"
+            if it["id"] in seen or nk in seen_norm:
                 continue
             seen.add(it["id"])
+            seen_norm.add(nk)
             merged.append(it)
 
     if not merged and errors:
@@ -224,13 +230,29 @@ def search(data):
 
     exclude_seen = bool(data.get("exclude_seen", True))
     prev_seen = set()
+    prev_norm = set()
     if exclude_seen:
         try:
-            prev_seen = set(ledger.seen().keys())
+            sdb = ledger.seen()
+            prev_seen = set(sdb.keys())
+            for v in sdb.values():
+                nm = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-яёіїєäöüßåøæ\s]", " ", str(v.get("name") or "").lower())).strip()
+                cty = str(v.get("city") or "").lower().strip()
+                if nm:
+                    prev_norm.add(f"{nm}|{cty}")
         except Exception:
             prev_seen = set()
-    if prev_seen:
-        merged = [it for it in merged if it.get("id") not in prev_seen]
+            prev_norm = set()
+    if prev_seen or prev_norm:
+        filtered = []
+        for it in merged:
+            if it.get("id") in prev_seen:
+                continue
+            nm = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-яёіїєäöüßåøæ\s]", " ", str(it.get("name") or "").lower())).strip()
+            if nm and f"{nm}|{city.lower().strip()}" in prev_norm:
+                continue
+            filtered.append(it)
+        merged = filtered
 
     # пересчитываем счётчики после фильтра
     n_no = sum(1 for it in merged if it.get("kind") == "nosite")

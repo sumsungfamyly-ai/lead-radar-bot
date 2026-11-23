@@ -8,6 +8,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.request
 
@@ -68,12 +69,26 @@ def _save(key, value):
     return value
 
 
+def _norm_name(name):
+    s = str(name or "").lower().strip()
+    s = re.sub(r"[\"'`’]", "", s)
+    s = re.sub(r"[^0-9a-zа-яёіїєäöüßåøæ\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def lead_id(name, addr="", site="", city="", lat=None, lon=None):
-    """Тот же id, что и в CRM бота: md5(name|lat|lon)[:12]."""
-    if lat is not None and lon is not None:
-        base = f"{str(name or '').lower()}|{round(float(lat), 4)}|{round(float(lon), 4)}"
-    else:
-        base = "|".join(str(x or "").strip().lower() for x in (name, addr, site, city))
+    """Стабильный id лида: нормализованное имя + город/координаты."""
+    nm = _norm_name(name)
+    ct = str(city or "").strip().lower()
+    try:
+        if lat is not None and lon is not None and str(lat) != "" and str(lon) != "":
+            base = f"{nm}|{ct}|{round(float(lat), 3)}|{round(float(lon), 3)}"
+        else:
+            ad = re.sub(r"\s+", " ", str(addr or "").strip().lower())
+            base = f"{nm}|{ct}|{ad}"
+    except Exception:
+        base = f"{nm}|{ct}|{str(addr or '').lower()}"
     return hashlib.md5(base.encode("utf-8")).hexdigest()[:12]
 
 
