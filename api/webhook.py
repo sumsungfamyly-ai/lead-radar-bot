@@ -1,5 +1,6 @@
-import os, re, ssl, json, time, html, hashlib, datetime, io, csv, base64
+import os, re, ssl, json, time, html, hashlib, datetime, io, csv, base64, math
 import urllib.request, urllib.parse, urllib.error
+import xml.etree.ElementTree as ET
 import concurrent.futures as cf
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -13,7 +14,7 @@ BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 OVERPASS = ["https://overpass-api.de/api/interpreter",
             "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter",
-            "https://overpass.osm.jp/api/interpreter"]
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
 
 # ---------- ТВОИ ДАННЫЕ (задаются в Vercel -> Environment Variables) ----------
 ME = os.environ.get("MY_NAME") or "[ваше имя]"
@@ -658,6 +659,51 @@ def get_json(url, data=None, timeout=25):
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
+def get_bytes(url, timeout=15):
+    req = urllib.request.Request(url, headers=UA)
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def osm_api_data(bbox, niche_tags):
+    """Запасной путь: основной API OpenStreetMap (другая инфраструктура, не Overpass).
+    Если район слишком плотный (>50000 узлов) — автоматически уменьшаем область."""
+    want = set(tuple(t.split("=")) for t in niche_tags)
+    s, w, n, e = bbox
+    root = None
+    for _ in range(4):
+        url = f"https://api.openstreetmap.org/api/0.6/map?bbox={w},{s},{e},{n}"
+        try:
+            root = ET.fromstring(get_bytes(url, timeout=12))
+            break
+        except urllib.error.HTTPError as err:
+            body = err.read()
+            if err.code == 400 and b"too many nodes" in body:
+                clat, clon = (s + n) / 2, (w + e) / 2
+                hs, hw = (n - s) / 4, (e - w) / 4
+                s, w, n, e = clat - hs, clon - hw, clat + hs, clon + hw
+                continue
+            raise
+    if root is None:
+        raise RuntimeError("osm area too dense")
+    nodes, elements = {}, []
+    for nd in root.iter("node"):
+        la, lo = float(nd.get("lat")), float(nd.get("lon"))
+        nodes[nd.get("id")] = (la, lo)
+        tags = {t.get("k"): t.get("v") for t in nd.findall("tag")}
+        if tags.get("name") and any(tags.get(k) == v for k, v in want):
+            elements.append({"tags": tags, "lat": la, "lon": lo})
+    for wy in root.iter("way"):
+        tags = {t.get("k"): t.get("v") for t in wy.findall("tag")}
+        if not tags.get("name") or not any(tags.get(k) == v for k, v in want):
+            continue
+        pts = [nodes[r.get("ref")] for r in wy.findall("nd") if r.get("ref") in nodes]
+        if pts:
+            elements.append({"tags": tags,
+                             "center": {"lat": sum(p[0] for p in pts) / len(pts),
+                                        "lon": sum(p[1] for p in pts) / len(pts)}})
+    return {"elements": elements}
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -743,7 +789,7 @@ def geocode(city):
     answered = False
     try:
         geo = get_json("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
-                       + urllib.parse.quote(city), timeout=12)
+                       + urllib.parse.quote(city), timeout=8)
         answered = True
         if geo:
             s, n, w, e = map(float, geo[0]["boundingbox"])
@@ -752,7 +798,7 @@ def geocode(city):
         print("nominatim fail", e)
     try:
         geo = get_json("https://photon.komoot.io/api/?limit=1&q="
-                       + urllib.parse.quote(city), timeout=12)
+                       + urllib.parse.quote(city), timeout=8)
         answered = True
         f = (geo.get("features") or [None])[0]
         if f:
@@ -765,8 +811,9 @@ def geocode(city):
     return "notfound" if answered else None
 
 
-def find_leads(niche_key, mode, city, flags="---"):
+def find_leads(niche_key, mode, city, flags=""):
     """flags: p — только с телефоном, e — только с email, c — без сетей."""
+    deadline = time.time() + 45  # общий бюджет: Vercel даёт 60 с, оставляем запас
     city, radius = parse_city(city)
     geo = geocode(city)
     if geo == "notfound":
@@ -775,6 +822,9 @@ def find_leads(niche_key, mode, city, flags="---"):
         raise RuntimeError("geocode down")
     lat, lon, bbox = geo
     if radius:
+        dlat = radius / 111.0
+        dlon = radius / (111.0 * max(0.2, math.cos(math.radians(lat))))
+        s, w, n, e = lat - dlat, lon - dlon, lat + dlat, lon + dlon
         area = f"(around:{radius * 1000},{lat},{lon})"
     else:
         if bbox:
@@ -792,16 +842,26 @@ def find_leads(niche_key, mode, city, flags="---"):
     for tag in NICHES[niche_key][1]:
         k, v = tag.split("=")
         parts += f'nwr["{k}"="{v}"]["name"]{area};'
-    query = f"[out:json][timeout:15];({parts});out tags center 300;"
+    query = f"[out:json][timeout:10];({parts});out tags center 300;"
     data = None
     for ep in OVERPASS:
-        try:
-            data = get_json(ep, data=urllib.parse.urlencode({"data": query}).encode(), timeout=20)
+        left = deadline - time.time()
+        if left < 14:  # бережём время для запасного пути и проверки сайтов
             break
-        except Exception as e:
-            print("overpass fail", ep, e)
+        try:
+            data = get_json(ep, data=urllib.parse.urlencode({"data": query}).encode(),
+                            timeout=max(4, min(12, left - 10)))
+            break
+        except Exception as err:
+            print("overpass fail", ep, err)
     if data is None:
-        raise RuntimeError("overpass down")
+        # все Overpass легли/перегружены — идём в основной API OpenStreetMap
+        try:
+            data = osm_api_data((s, w, n, e), NICHES[niche_key][1])
+            print("overpass down, used osm api fallback")
+        except Exception as err:
+            print("osm api fail", err)
+            raise RuntimeError("maps down")
 
     elements = data.get("elements", [])
     name_counts = {}
@@ -849,7 +909,7 @@ def find_leads(niche_key, mode, city, flags="---"):
         cands = with_site[:MAX_ANALYZE]
         with cf.ThreadPoolExecutor(max_workers=16) as ex:
             futs = {ex.submit(analyze, it["site"]): it for it in cands}
-            done, _ = cf.wait(futs, timeout=22)
+            done, _ = cf.wait(futs, timeout=max(6, min(20, deadline - time.time())))
             for f in done:
                 try:
                     it = futs[f]
@@ -1011,8 +1071,8 @@ def run_search(chat_id, key, mode, city, offset, token=None, cleanup=(), flags="
         delete_msg(chat_id, mid)
     if res == "error":
         tg("sendMessage", chat_id=chat_id,
-           text="⚠️ Серверы карт сейчас перегружены. Я пробовал несколько запасных — "
-                "попробуй ещё раз через минуту, обычно помогает.")
+           text="⚠️ Все серверы карт сейчас перегружены — я пробовал 4 запасных и основной API OSM. "
+                "Это временно: подожди 1–2 минуты и повтори поиск.")
         return
     if res is None:
         tg("sendMessage", chat_id=chat_id, text="Не нашёл такой город 🤷 Проверь название или напиши по-английски.")
@@ -1315,7 +1375,20 @@ def send_fav(chat_id):
         remember(chat_id, "fav", m["message_id"])
 
 
+# Защита от повторов: Telegram переотправляет апдейт, если бот отвечал слишком долго.
+# Запоминаем обработанные update_id, чтобы не отвечать дважды/трижды.
+_SEEN_UPDATES = {}
+
+
 def handle(update):
+    uid = update.get("update_id")
+    if uid is not None:
+        if uid in _SEEN_UPDATES:
+            return
+        _SEEN_UPDATES[uid] = 1
+        if len(_SEEN_UPDATES) > 500:
+            for k in list(_SEEN_UPDATES)[:250]:
+                _SEEN_UPDATES.pop(k, None)
     cb = update.get("callback_query")
     if cb:
         tg("answerCallbackQuery", callback_query_id=cb["id"])
