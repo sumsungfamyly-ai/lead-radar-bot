@@ -13,7 +13,7 @@ lib/ledger.py     история поисков, «новые лиды», ста
 lib/miniapp_ui.py вёрстка мини-приложения: радар, карта, фильтры, карточки, шторки
 api/cron.py       ежедневные follow-up и утренний дайджест новых лидов (Vercel Cron)
 vercel.json      конфигурация Vercel (лимиты времени + cron)
-pyproject.toml   метаданные проекта (без single-entrypoint, чтобы Vercel видел все api/*.py)
+pyproject.toml   entrypoint для Vercel (api.index:app роутит на webhook/miniapp/cron)
 set_webhook.py   подключение бота к Vercel одной командой
 test_bot.py      локальный тест логики (без Telegram и интернета)
 .env.example     пример переменных
